@@ -1,6 +1,8 @@
 # SO-101 Hackathon
 
-Team workspace for **SO-101 leader → follower teleoperation** with **[Neuracore](https://neuracore.ai)** data collection, plus **overhead camera** and **Atech.dev** humidity sensing for training.
+> **Branch `overhead-camera-only`:** Neuracore logging with **overhead RGB + robot joints only** (no humidity yet). Use `main` when Atech humidity is wired up.
+
+Team workspace for **SO-101 leader → follower teleoperation** with **[Neuracore](https://neuracore.ai)** data collection and an **overhead camera** for training.
 
 All project code lives in this repository: [SamFricker/SO-101_Hackathon](https://github.com/SamFricker/SO-101_Hackathon). Do **not** use a separate nested git repo inside `example_so101/`.
 
@@ -11,10 +13,9 @@ All project code lives in this repository: [SamFricker/SO-101_Hackathon](https:/
 | Item | Purpose |
 |------|---------|
 | 2× SO-101 arms | Leader (hand-guided) + follower (executes motion) |
-| 3× USB connections | Leader, follower, Atech motherboard (each needs its own COM port on Windows) |
-| 1–2× USB webcams | Wrist/workspace + overhead scene camera (optional) |
+| 2× USB connections | Leader + follower (each needs its own COM port on Windows) |
+| 1× USB webcam | Overhead scene camera (fixed above the workspace) |
 | [Neuracore](https://www.neuracore.com/) account | Login, datasets, recording, training |
-| [Atech](https://atech.dev) kit + firmware | Temperature & humidity module (USB serial) |
 | Python 3.10+ | 3.10–3.12 recommended; 3.13 works with `feetech-servo-sdk` |
 
 ---
@@ -109,24 +110,7 @@ Calibration file path (Windows):
 
 ---
 
-## Step 4 — Atech humidity module
-
-1. Build firmware on [atech.dev](https://atech.dev) with the **Temperature & Humidity** module.
-2. Flash over USB (USB transport, **115200 baud**).
-3. Plug the Atech board into the PC via USB-C (separate from the robot arms).
-4. Close the Atech browser dashboard while recording — only one app should use the serial port.
-
-The board emits JSON lines, for example:
-
-```json
-{"type":"sensor","key":"humidity","value":65.2,"module_type":"aht20"}
-```
-
-See [Atech module docs](https://atech.dev/docs).
-
----
-
-## Step 5 — Neuracore login
+## Step 4 — Neuracore login
 
 ```powershell
 cd example_so101
@@ -138,17 +122,17 @@ Follow the prompt and save your API key. Alternatively set `NEURACORE_API_KEY` (
 
 ---
 
-## Step 6 — Configure cameras (optional)
+## Step 5 — Configure overhead camera
 
-Edit `example_so101/examples/common/configs.py`:
+This project assumes **one overhead camera** (OpenCV device index `0` by default). Edit `example_so101/examples/common/configs.py` if needed:
 
-| Setting | Meaning |
-|---------|---------|
-| `CAMERA_DEVICE_INDEX` | Wrist/workspace webcam (OpenCV index, often `0` or `1`) |
-| `OVERHEAD_CAMERA_DEVICE_INDEX` | Overhead scene camera |
-| `HUMIDITY_SERIAL_PORT` | Default Atech COM port (can override on CLI) |
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `OVERHEAD_CAMERA_DEVICE_INDEX` | `0` | Your overhead webcam |
+| `CAMERA_DEVICE_INDEX` | `-1` | Wrist camera off (set to `0` or `1` only if you add a second cam) |
+If the overhead feed is black or wrong, try `--overhead-camera-index 0` or `1` in the collection command.
 
-Test a webcam without the robot:
+Test the overhead camera without the robot (uses the legacy wrist thread on index `0` — set `CAMERA_DEVICE_INDEX = 0` in `configs.py` first, or rely on the collection script):
 
 ```powershell
 python scripts\test_camera_thread.py
@@ -156,9 +140,9 @@ python scripts\test_camera_thread.py
 
 ---
 
-## Step 7 — Collect training data
+## Step 6 — Collect training data
 
-Replace `COM3`, `COM4`, `COM6` with your ports (leader, follower, Atech).
+Replace `COM3` and `COM4` with your leader and follower ports.
 
 ```powershell
 cd example_so101
@@ -169,10 +153,8 @@ python examples\2_collect_teleop_data_with_neuracore.py `
   --leader-id my_awesome_leader_arm `
   --follower-port COM4 `
   --follower-id my_awesome_follower_arm `
-  --wrist-camera-index 1 `
   --overhead-camera-index 0 `
-  --humidity-source atech `
-  --humidity-serial-port COM6 `
+  --humidity-source none `
   --dataset-name so101-demo
 ```
 
@@ -183,10 +165,7 @@ python examples\2_collect_teleop_data_with_neuracore.py `
 | Joint positions | `log_joint_positions` | SO-101 joints |
 | Joint targets | `log_joint_target_positions` | SO-101 joints |
 | Gripper | `log_parallel_gripper_*` | `gripper` |
-| Wrist camera | `log_rgb` | `wrist_camera` |
 | Overhead camera | `log_rgb` | `overhead_camera` |
-| Humidity (% RH) | `log_custom_1d` | `humidity` |
-
 ### Recording episodes
 
 1. Run the script above.
@@ -201,15 +180,13 @@ The follower arm is **enabled automatically** at startup. Keep a clear workspace
 
 | Flag | Description |
 |------|-------------|
-| `--wrist-camera-index -1` | Disable wrist camera |
+| `--wrist-camera-index 0` | Enable a second (wrist) camera (default: disabled) |
 | `--overhead-camera-index -1` | Disable overhead camera |
-| `--humidity-source none` | Disable humidity |
-| `--humidity-source mock` | Fake humidity (no Atech hardware) |
-| `--humidity-serial-baud 115200` | Atech baud rate (default 115200) |
+| `--humidity-source atech` | Enable Atech humidity (when on `main` with hardware ready) |
 
 ---
 
-## Step 8 — Teleop without Neuracore (debug)
+## Step 7 — Teleop without Neuracore (debug)
 
 ```powershell
 python examples\1_leader_arm_teleop_so101.py --real-robot `
@@ -219,7 +196,7 @@ python examples\1_leader_arm_teleop_so101.py --real-robot `
 
 ---
 
-## Step 9 — Push changes to Sam’s repo
+## Step 8 — Push changes to Sam’s repo
 
 From the **hackathon root** (not inside a nested `.git`):
 
@@ -241,8 +218,7 @@ Use a branch + pull request if your team prefers review before merging to `main`
 |---------|-------------|
 | `Calibration file not found` | Run `lerobot-calibrate` with the same `--teleop.id` as `--leader-id` |
 | `Failed to open port` | Wrong COM port; close other apps using the port |
-| Atech humidity never updates | Correct COM port; close Atech web UI; firmware uses USB @ 115200 |
-| No camera frames | Try `--wrist-camera-index 0` or `1`; only one app per camera |
+| No camera frames | Try `--overhead-camera-index 0` or `1`; only one app per camera |
 | `scservo-sdk` not found | `pip install feetech-servo-sdk==1.0.0` |
 | Repo “inside” another repo | Delete `example_so101\.git` if it reappears; commit files only in `SO-101_Hackathon` |
 

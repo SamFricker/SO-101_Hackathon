@@ -278,7 +278,7 @@ def main() -> None:
     nc.create_dataset(
         name=dataset_name,
         description=(
-            "SO101 teleop with wrist/overhead RGB and external humidity "
+            "SO101 teleop with overhead RGB (no humidity on this branch) "
             "(LeRobot SO101 leader + follower)."
         ),
     )
@@ -434,7 +434,7 @@ def main() -> None:
     print("🚀 Starting teleoperation with Neuracore data collection...")
     print("   - Move the SO101 leader arm to drive the follower.")
     print("   - The real SO101 follower is being commanded.")
-    print("   - Streams: joints, gripper, wrist + overhead RGB, humidity.")
+    print("   - Streams: joints, gripper, overhead RGB.")
     print("   - Start/stop episodes in the Neuracore web UI.")
     print("⚠️  Press Ctrl+C to exit")
     print()

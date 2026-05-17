@@ -42,27 +42,28 @@ ROBOT_RATE = 100.0
 JOINT_STATE_STREAMING_RATE = 100.0
 CAMERA_FRAME_STREAMING_RATE = 30.0
 
-# USB webcams (OpenCV device indices)
-CAMERA_DEVICE_INDEX = 1  # Wrist / workspace camera
+# USB webcams (OpenCV device indices; -1 = disabled)
+# Hackathon default: one overhead camera only (device 0). Set wrist index >= 0 to enable a second cam.
+CAMERA_DEVICE_INDEX = -1  # Wrist / workspace camera (disabled)
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAMERA_LOGGING_NAME = "wrist_camera"
 
-# Overhead / scene camera (e.g. fixed mount above the workspace)
+# Overhead / scene camera (fixed mount above the workspace)
 OVERHEAD_CAMERA_ENABLED = True
-OVERHEAD_CAMERA_DEVICE_INDEX = 0
+OVERHEAD_CAMERA_DEVICE_INDEX = 0  # Usually 0 when it is the only USB camera
 OVERHEAD_CAMERA_WIDTH = 640
 OVERHEAD_CAMERA_HEIGHT = 480
 OVERHEAD_CAMERA_LOGGING_NAME = "overhead_camera"
 OVERHEAD_CAMERA_ROTATE_180 = False
 
-# External humidity: Atech Temperature & Humidity module (aht20) via USB serial
-# https://atech.dev/docs — JSON lines at 115200 baud, key "humidity" (%RH)
-HUMIDITY_ENABLED = True
+# External humidity (disabled on overhead-camera-only branch; enable on main later)
+# Atech module: https://atech.dev/docs — JSON @ 115200, key "humidity"
+HUMIDITY_ENABLED = False
 HUMIDITY_STREAMING_RATE = 1.0  # Hz
 HUMIDITY_LOGGING_NAME = "humidity"
 # Default source: "atech" | "mock" | "http" | "serial" | "none"
-HUMIDITY_SOURCE = "atech"
+HUMIDITY_SOURCE = "none"
 HUMIDITY_HTTP_URL = ""
 HUMIDITY_HTTP_JSON_KEY = "humidity"
 HUMIDITY_SERIAL_PORT = ""  # e.g. COM6 — Atech board USB (separate from robot arms)
