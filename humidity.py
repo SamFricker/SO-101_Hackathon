@@ -11,6 +11,7 @@ print(f"Connected to {PORT}. Collecting baseline for {BASELINE_SECONDS}s...\n")
 baseline_samples = {"temperature": [], "humidity": []}
 baseline = {}
 start = time.time()
+latest = {}
 
 while True:
     line = ser.readline().decode(errors='ignore').strip()
@@ -35,22 +36,44 @@ while True:
         elapsed = time.time() - start
         remaining = BASELINE_SECONDS - elapsed
         if remaining > 0:
-            if value != 0.0:  # ignore sensor init zeroes
+            if value != 0.0:
                 baseline_samples[key].append(value)
             print(f"  Baseline ({remaining:.0f}s left) — {key}: {value:.1f}", end="\r", flush=True)
             continue
         else:
-            # Compute baseline averages
             for k, samples in baseline_samples.items():
                 baseline[k] = sum(samples) / len(samples) if samples else 0.0
             print(f"\nBaseline set — Temp: {baseline['temperature']:.1f}°C  |  Humidity: {baseline['humidity']:.1f}%\n", flush=True)
-            print(f"{'Reading':<12} {'Current':>10} {'Baseline':>10} {'Difference':>12}", flush=True)
-            print("-" * 48, flush=True)
 
-    # Live diff phase
+    # Store latest diff
     diff = value - baseline.get(key, value)
-    sign = "+" if diff >= 0 else ""
     if key == "temperature":
-        print(f"{'Temperature':<12} {value:>9.1f}°C {baseline['temperature']:>9.1f}°C {sign}{diff:>10.1f}°C", flush=True)
+        latest["temp_diff"] = diff
+        latest["temp_label"] = "ambient" if diff == 0 else ("hot" if diff > 0 else "cold")
+        latest["temp_sign"] = "+" if diff >= 0 else "-"
     elif key == "humidity":
-        print(f"{'Humidity':<12} {value:>10.1f}% {baseline['humidity']:>10.1f}% {sign}{diff:>11.1f}%", flush=True)
+        latest["hum_diff"] = diff
+        latest["hum_label"] = "ambient" if diff == 0 else ("wet" if diff > 0 else "dry")
+        latest["hum_sign"] = "+" if diff >= 0 else "-"
+
+    # Print once both values are available
+    if all(k in latest for k in ("temp_diff", "hum_diff")):
+        t_sign, t_diff, t_label = latest["temp_sign"], abs(latest["temp_diff"]), latest["temp_label"]
+        h_sign, h_diff, h_label = latest["hum_sign"], abs(latest["hum_diff"]), latest["hum_label"]
+
+        print(f"Temp: {t_sign}{t_diff:.1f}°C ({t_label})  |  Humidity: {h_sign}{h_diff:.1f}% ({h_label})", flush=True)
+
+        if t_label == "ambient" and h_label == "ambient":
+            status = "Ambient 🌡️💧"
+        elif h_label == "wet" and t_label == "hot":
+            status = "Wet and hot 💧🔥"
+        elif h_label == "wet" and t_label == "cold":
+            status = "Wet and cold 💧🧊"
+        elif h_label == "dry" and t_label == "hot":
+            status = "Dry and hot 🌵🔥"
+        elif h_label == "dry" and t_label == "cold":
+            status = "Dry and cold 🌵🧊"
+        else:
+            status = f"{t_label.capitalize()} and {h_label} 🌡️"
+
+        print(f"Status: {status}\n", flush=True)
