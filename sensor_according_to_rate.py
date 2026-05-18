@@ -21,8 +21,39 @@ def classify(avg_rate, threshold):
     if avg_rate < -threshold: return "negative"
     return "ambient"
 
+def run_baseline(key, value, elapsed):
+    global state
+    baseline[key] = value
+    print(f"  Baseline... {BASELINE_SECONDS - elapsed:.1f}s remaining", end="\r", flush=True)
+
+    if elapsed >= BASELINE_SECONDS:
+        state = "waiting"
+        print(f"\nBaseline set. Press Enter to measure a clothing item.\n", flush=True)
+
+def run_measurement(key, rate, elapsed):
+    global state
+    phase_rates[key].append(rate)
+    print(f"  Measuring... {MEASURE_SECONDS - elapsed:.1f}s left", end="\r", flush=True)
+
+    if elapsed >= MEASURE_SECONDS:
+        h_rates = phase_rates["humidity"]
+
+        if h_rates:
+            h_avg   = sum(h_rates) / len(h_rates)
+            h_class = classify(h_avg, HUM_THRESHOLD)
+            status  = "Wet 💧" if h_class == "positive" else "Dry 🌵"
+
+            print(f"\n\nResult:", flush=True)
+            print(f"  Humidity rate avg: {h_avg:+.4f}%/s", flush=True)
+            print(f"  Classification:    {status}", flush=True)
+        else:
+            print("\nNot enough data — try again.", flush=True)
+
+        state = "waiting"
+        print(f"\nRemove clothing. Press Enter for next item...\n", flush=True)
+
 def read_serial():
-    global state, phase_start, phase_rates, baseline
+    global state, phase_start
 
     ser = serial.Serial(PORT, 115200, timeout=2)
     print("Connected to COM5.")
@@ -65,38 +96,11 @@ def read_serial():
             elapsed = now - phase_start
 
             if state == "baseline":
-                remaining = BASELINE_SECONDS - elapsed
-                baseline[key] = value
-                print(f"  Baseline... {remaining:.1f}s remaining", end="\r", flush=True)
-
-                if elapsed >= BASELINE_SECONDS:
-                    state = "waiting"
-                    print(f"\nBaseline set. Press Enter to measure a clothing item.\n", flush=True)
-
+                run_baseline(key, value, elapsed)
             elif state == "waiting":
                 continue
-
             elif state == "measuring":
-                remaining = MEASURE_SECONDS - elapsed
-                phase_rates[key].append(rate)
-                print(f"  Measuring... {remaining:.1f}s left", end="\r", flush=True)
-
-                if elapsed >= MEASURE_SECONDS:
-                    h_rates = phase_rates["humidity"]
-
-                    if h_rates:
-                        h_avg   = sum(h_rates) / len(h_rates)
-                        h_class = classify(h_avg, HUM_THRESHOLD)
-                        status  = "Wet 💧" if h_class == "positive" else "Dry 🌵"
-
-                        print(f"\n\nResult:", flush=True)
-                        print(f"  Humidity rate avg: {h_avg:+.4f}%/s", flush=True)
-                        print(f"  Classification:    {status}", flush=True)
-                    else:
-                        print("\nNot enough data — try again.", flush=True)
-
-                    state = "waiting"
-                    print(f"\nRemove clothing. Press Enter for next item...\n", flush=True)
+                run_measurement(key, rate, elapsed)
 
 thread = threading.Thread(target=read_serial, daemon=True)
 thread.start()
