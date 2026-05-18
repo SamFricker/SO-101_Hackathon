@@ -19,7 +19,7 @@ from so101_controller import SO101Controller
 # ============================================
 
 robot = SO101Controller(
-    port="COM6",
+    port="COM5",
     follower_id="my_follower_arm",
     robot_rate=ROBOT_RATE,
     neutral_joint_angles=NEUTRAL_JOINT_ANGLES,
