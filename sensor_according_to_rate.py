@@ -15,6 +15,11 @@ state       = "baseline"
 phase_start = None
 phase_rates = {"humidity": []}
 baseline    = {}
+last_result = None  # "Wet" or "Dry" — updated after each measurement
+
+def get_result():
+    """Return the most recent classification, or None if no measurement done yet."""
+    return last_result
 
 def classify(avg_rate, threshold):
     if avg_rate > threshold:  return "positive"
@@ -31,7 +36,7 @@ def run_baseline(key, value, elapsed):
         print(f"\nBaseline set. Press Enter to measure a clothing item.\n", flush=True)
 
 def run_measurement(key, rate, elapsed):
-    global state
+    global state, last_result
     phase_rates[key].append(rate)
     print(f"  Measuring... {MEASURE_SECONDS - elapsed:.1f}s left", end="\r", flush=True)
 
@@ -39,9 +44,10 @@ def run_measurement(key, rate, elapsed):
         h_rates = phase_rates["humidity"]
 
         if h_rates:
-            h_avg   = sum(h_rates) / len(h_rates)
-            h_class = classify(h_avg, HUM_THRESHOLD)
-            status  = "Wet 💧" if h_class == "positive" else "Dry 🌵"
+            h_avg     = sum(h_rates) / len(h_rates)
+            h_class   = classify(h_avg, HUM_THRESHOLD)
+            last_result = "Wet" if h_class == "positive" else "Dry"
+            status    = f"{last_result} 💧" if last_result == "Wet" else f"{last_result} 🌵"
 
             print(f"\n\nResult:", flush=True)
             print(f"  Humidity rate avg: {h_avg:+.4f}%/s", flush=True)
