@@ -23,7 +23,7 @@ from so101_controller import SO101Controller
 # -----------------------------
 # ROBOT CONFIG
 # -----------------------------
-PORT = "COM5"
+PORT = "COM6"
 FOLLOWER_ID = "my_follower_arm"
 POSES_FILE = "poses.json"
 
@@ -40,7 +40,7 @@ JOINT_LIMITS = [
 # -----------------------------
 # SENSOR CONFIG
 # -----------------------------
-SENSOR_PORT = "COM6"
+SENSOR_PORT = "COM7"
 BASELINE_SECONDS = 10
 MEASURE_SECONDS = 5
 HUM_THRESHOLD = 0.05
@@ -103,7 +103,7 @@ def move_to_pose(name):
         time.sleep(MOVE_SPEED)
 
 def open_gripper():
-    robot.set_gripper_open_value(1.0)
+    robot.set_gripper_open_value(0.5)
 
 def close_gripper():
     robot.set_gripper_open_value(0.0)
