@@ -4,39 +4,32 @@ import time
 import threading
 
 PORT = "COM5"
-SETTLE_SECONDS  = 5     # time to confirm sensor is back to neutral (no clothing)
-MEASURE_SECONDS = 5     # time to measure clothing
-TEMP_THRESHOLD  = 0.01  # °C/s
-HUM_THRESHOLD   = 0.05  # %/s
+BASELINE_SECONDS = 10   # one-time startup baseline
+MEASURE_SECONDS  = 5    # time to measure clothing
+HUM_THRESHOLD    = 0.05  # %/s
 
 lock = threading.Lock()
 
-prev = {}
-
-state          = "waiting"
-phase_start    = None
-phase_rates    = {"temperature": [], "humidity": []}
-local_baseline = {}
+prev        = {}
+state       = "baseline"
+phase_start = None
+phase_rates = {"humidity": []}
+baseline    = {}
 
 def classify(avg_rate, threshold):
     if avg_rate > threshold:  return "positive"
     if avg_rate < -threshold: return "negative"
     return "ambient"
 
-def get_status(t_class, h_class):
-    hot = t_class == "positive"
-    wet = h_class == "positive"
-    if wet and hot:   return "Wet and hot 💧🔥"
-    if wet and not hot: return "Wet and cold 💧🧊"
-    if not wet and hot: return "Dry and hot 🌵🔥"
-    return "Dry and cold 🌵🧊"
-
 def read_serial():
-    global state, phase_start, phase_rates, local_baseline
+    global state, phase_start, phase_rates, baseline
 
     ser = serial.Serial(PORT, 115200, timeout=2)
     print("Connected to COM5.")
-    print("Press Enter to begin measuring a clothing item.\n", flush=True)
+    print(f"Reading baseline for {BASELINE_SECONDS}s — keep sensor clear...\n", flush=True)
+
+    with lock:
+        phase_start = time.time()
 
     while True:
         line = ser.readline().decode(errors='ignore').strip()
@@ -53,7 +46,7 @@ def read_serial():
         except (json.JSONDecodeError, KeyError):
             continue
 
-        if key not in ("temperature", "humidity"):
+        if key != "humidity":
             continue
 
         now  = time.time()
@@ -66,41 +59,37 @@ def read_serial():
         prev[key] = {"value": value, "time": now}
 
         with lock:
-            if state == "waiting" or rate is None:
+            if rate is None or phase_start is None:
                 continue
 
-            elapsed   = now - phase_start
-            remaining = (SETTLE_SECONDS if state == "settling" else MEASURE_SECONDS) - elapsed
+            elapsed = now - phase_start
 
-            if state == "settling":
-                local_baseline[key] = value
-                print(f"  Settling... {remaining:.1f}s (ensure no clothing near sensor)", end="\r", flush=True)
+            if state == "baseline":
+                remaining = BASELINE_SECONDS - elapsed
+                baseline[key] = value
+                print(f"  Baseline... {remaining:.1f}s remaining", end="\r", flush=True)
 
-                if elapsed >= SETTLE_SECONDS:
-                    state       = "measuring"
-                    phase_start = now
-                    phase_rates = {"temperature": [], "humidity": []}
-                    print(f"\nPlace clothing near sensor now — measuring for {MEASURE_SECONDS}s...", flush=True)
+                if elapsed >= BASELINE_SECONDS:
+                    state = "waiting"
+                    print(f"\nBaseline set. Press Enter to measure a clothing item.\n", flush=True)
+
+            elif state == "waiting":
+                continue
 
             elif state == "measuring":
-                if key in local_baseline:
-                    phase_rates[key].append(rate)
-
+                remaining = MEASURE_SECONDS - elapsed
+                phase_rates[key].append(rate)
                 print(f"  Measuring... {remaining:.1f}s left", end="\r", flush=True)
 
                 if elapsed >= MEASURE_SECONDS:
-                    t_rates = phase_rates["temperature"]
                     h_rates = phase_rates["humidity"]
 
-                    if t_rates and h_rates:
-                        t_avg   = sum(t_rates) / len(t_rates)
+                    if h_rates:
                         h_avg   = sum(h_rates) / len(h_rates)
-                        t_class = classify(t_avg, TEMP_THRESHOLD)
                         h_class = classify(h_avg, HUM_THRESHOLD)
-                        status  = get_status(t_class, h_class)
+                        status  = "Wet 💧" if h_class == "positive" else "Dry 🌵"
 
                         print(f"\n\nResult:", flush=True)
-                        print(f"  Temp rate avg:     {t_avg:+.4f}°C/s", flush=True)
                         print(f"  Humidity rate avg: {h_avg:+.4f}%/s", flush=True)
                         print(f"  Classification:    {status}", flush=True)
                     else:
@@ -113,16 +102,15 @@ thread = threading.Thread(target=read_serial, daemon=True)
 thread.start()
 
 def input_loop():
-    global state, phase_start, phase_rates, local_baseline
+    global state, phase_start, phase_rates
     while True:
         input()
         with lock:
             if state == "waiting":
-                state          = "settling"
-                phase_start    = time.time()
-                local_baseline = {}
-                phase_rates    = {"temperature": [], "humidity": []}
-                print(f"Settling for {SETTLE_SECONDS}s — keep sensor clear...", flush=True)
+                state       = "measuring"
+                phase_start = time.time()
+                phase_rates = {"humidity": []}
+                print(f"Place clothing near sensor — measuring for {MEASURE_SECONDS}s...", flush=True)
 
 input_thread = threading.Thread(target=input_loop, daemon=True)
 input_thread.start()
