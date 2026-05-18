@@ -1,0 +1,23 @@
+{
+    "ignorePaths": [
+        "cSpell.json",
+        ".*",
+        "*.Dockerfile",
+        "docker-compose.yml",
+        "requirements*.txt",
+        "*.sh",
+        "changelogs/"
+    ],
+    "dictionaryDefinitions": [
+        {
+            "name": "neuracore-dictionary",
+            "path": "./neuracore-dictionary.txt",
+            "addWords": true
+        }
+    ],
+    "language": "en,en-GB",
+    "dictionaries": [
+        "neuracore-dictionary"
+    ],
+    "words": []
+}

@@ -1,0 +1,87 @@
+defaults:
+  - _self_
+  - optional user: null
+  - algorithm: null
+  - override hydra/launcher: basic
+
+training_name:
+training_name_auto_increment: false
+training_id: null
+
+org_id: null
+
+# Only one of the below needs to be provided.
+dataset_name:
+dataset_id:
+
+# Only one of the below needs to be provided.
+algorithm_name:
+algorithm_id:
+
+algorithm_params: null
+
+# Core training parameters
+seed: 42
+epochs: 100
+output_prediction_horizon: 100
+validation_split: 0.2
+frequency: 10
+allow_duplicates: true
+
+# Resume training
+resume_checkpoint_path: null  # Path to checkpoint to resume from
+
+logging_frequency: 50
+keep_last_n_checkpoints: 2
+device: null  # e.g., "cuda:0", "mps", "cpu"
+
+input_data_types:
+output_data_types:
+
+input_cross_embodiment_description: {
+
+}
+output_cross_embodiment_description: {
+
+}
+
+# Batch size (can be "auto" for automatic tuning or an integer)
+batch_size: "auto"
+
+num_train_workers: 2
+num_val_workers: 1
+
+# Maximum number of workers to use for prefetching recordings
+max_prefetch_workers: 4
+
+max_delay_s: null
+trim_start_end: true
+
+# Dict[str, Dict[DataType, List[MethodConfig]]], e.g.:
+# for images, we must have a resize step to reshape all images from different sources to the same size.
+preprocessing:
+  input:
+    RGB_IMAGES:
+      - _target_: neuracore.ml.preprocessing.methods.resize_pad.ResizePad
+        size: [224, 224]
+    DEPTH_IMAGES:
+      - _target_: neuracore.ml.preprocessing.methods.resize_pad.ResizePad
+        size: [224, 224]
+  output:
+    RGB_IMAGES:
+      - _target_: neuracore.ml.preprocessing.methods.resize_pad.ResizePad
+        size: [224, 224]
+    DEPTH_IMAGES:
+      - _target_: neuracore.ml.preprocessing.methods.resize_pad.ResizePad
+        size: [224, 224]
+
+# Output directory (generated dynamically with the resolver)
+local_output_dir: ${resolve_output_dir:${training_name},${training_name_auto_increment}}
+
+# Hydra configuration
+hydra:
+  run:
+    dir: ${local_output_dir}
+  sweep:
+    dir: ${local_output_dir}
+    subdir: ${hydra:job.num}

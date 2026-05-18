@@ -1,0 +1,370 @@
+"""TrainingStorageHandler for managing model training artifacts and checkpoints."""
+
+import logging
+from pathlib import Path
+from typing import IO, Any
+
+import requests
+import torch
+from torch import nn
+
+import neuracore as nc
+from neuracore.core.auth import get_auth
+from neuracore.core.config.get_current_org import get_current_org
+from neuracore.core.const import API_URL
+from neuracore.core.utils.http_session import Session
+from neuracore.ml.utils.nc_archive import create_nc_archive
+from neuracore.ml.utils.preprocessing_utils import PreprocessingConfiguration
+from neuracore.ml.utils.upload_storage_mixin import UploadStorageMixin
+
+logger = logging.getLogger(__name__)
+
+
+class TrainingStorageHandler(UploadStorageMixin):
+    """Handles storage operations for both local and GCS."""
+
+    def __init__(
+        self,
+        local_dir: str | None,
+        training_job_id: str | None = None,
+        algorithm_config: dict = {},
+        input_cross_embodiment_description: dict[str, Any] = {},
+        output_cross_embodiment_description: dict[str, Any] = {},
+        input_preprocessing_config: PreprocessingConfiguration = {},
+        output_preprocessing_config: PreprocessingConfiguration = {},
+    ) -> None:
+        """Initialize the storage handler.
+
+        Args:
+            local_dir: Local directory to save artifacts and checkpoints.
+            training_job_id: Optional ID of the training job for cloud logging.
+            algorithm_config: Optional configuration for the algorithm.
+            input_cross_embodiment_description: Input embodiment mapping
+                to persist with model artifacts.
+            output_cross_embodiment_description: Output embodiment mapping
+                to persist with model artifacts.
+            input_preprocessing_config: preprocessing configuration for the input
+                data.
+            output_preprocessing_config: preprocessing configuration for the output
+                data.
+        """
+        self.local_dir = Path(local_dir or "./output")
+        self.training_job_id = training_job_id
+        self.algorithm_config = algorithm_config
+        self.input_cross_embodiment_description = input_cross_embodiment_description
+        self.output_cross_embodiment_description = output_cross_embodiment_description
+        self.input_preprocessing_config = input_preprocessing_config
+        self.output_preprocessing_config = output_preprocessing_config
+        self.log_to_cloud = self.training_job_id is not None
+        self.org_id = get_current_org()
+        if self.log_to_cloud:
+            response = self._get_request(
+                f"{API_URL}/org/{self.org_id}/training/jobs/{self.training_job_id}"
+            )
+            if response.status_code != 200:
+                raise ValueError(
+                    f"Training job {self.training_job_id} not found or access denied."
+                )
+
+    def _get_upload_url(self, filepath: str, content_type: str) -> str:
+        """Get a signed upload URL for a file in cloud storage.
+
+        Args:
+            filepath: Path of the file to upload.
+            content_type: MIME type of the file.
+
+        Returns:
+            str: Signed URL for uploading the file.
+
+        Raises:
+            ValueError: If the request to get the upload URL fails.
+        """
+        params = {
+            "filepath": filepath,
+            "content_type": content_type,
+        }
+
+        response = self._get_request(
+            f"{API_URL}/org/{self.org_id}/training/jobs/{self.training_job_id}/upload-url",
+            params=params,
+        )
+        if response.status_code != 200:
+            raise ValueError(
+                f"Failed to get upload URL for {filepath}: {response.text}"
+            )
+        return response.json()["url"]
+
+    def _get_checkpoint_download_url(self, checkpoint_name: str) -> str:
+        """Get a signed download URL for a checkpoint file in cloud storage.
+
+        Args:
+            checkpoint_name: Name of the checkpoint file to download.
+
+        Returns:
+            str: Signed URL for downloading the checkpoint.
+
+        Raises:
+            ValueError: If the request to get the download URL fails.
+        """
+        response = self._get_request(
+            f"{API_URL}/org/{self.org_id}/training/jobs/{self.training_job_id}"
+            f"/checkpoint_url/{checkpoint_name}",
+        )
+        if response.status_code != 200:
+            raise ValueError(
+                f"Failed to get download URL for {checkpoint_name}: {response.text}"
+            )
+        return response.json()["url"]
+
+    def save_checkpoint(self, checkpoint: dict, relative_checkpoint_path: Path) -> None:
+        """Save checkpoint to storage.
+
+        Args:
+            checkpoint: Checkpoint dictionary to save.
+            relative_checkpoint_path: Relative path for the checkpoint file.
+        """
+        save_path = self.local_dir / relative_checkpoint_path
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Convert OmegaConf objects to plain Python types
+        # for compatibility with weights_only=True
+        checkpoint = self._convert_omegaconf_to_python(checkpoint)
+        torch.save(checkpoint, save_path)
+        if self.log_to_cloud:
+            upload_url = self._get_upload_url(
+                filepath=f"checkpoints/{relative_checkpoint_path.name}",
+                content_type="application/octet-stream",
+            )
+            with open(save_path, "rb") as f:
+                response = self._put_request(
+                    upload_url,
+                    data=f,
+                    headers={"Content-Type": "application/octet-stream"},
+                )
+            if response.status_code == 200:
+                try:
+                    save_path.unlink()
+                except Exception as e:
+                    logger.warning(
+                        "Could not delete local checkpoint "
+                        f"{relative_checkpoint_path}: {e}"
+                    )
+            else:
+                logger.error(
+                    f"Failed to save checkpoint {relative_checkpoint_path} "
+                    f"to cloud: {response.text}"
+                )
+                return
+
+    def _convert_omegaconf_to_python(self, obj: Any) -> Any:
+        """Recursively convert OmegaConf objects to plain Python types.
+
+        This is needed when saving optimizers and schedulers in the checkpoint.
+
+        Args:
+            obj: Object that may contain OmegaConf objects.
+
+        Returns:
+            Object with OmegaConf objects converted to plain Python types.
+        """
+        try:
+            from omegaconf import DictConfig, ListConfig
+        except ImportError:
+            # OmegaConf not available, return as-is
+            return obj
+
+        if isinstance(obj, DictConfig):
+            return {k: self._convert_omegaconf_to_python(v) for k, v in obj.items()}
+        elif isinstance(obj, ListConfig):
+            return [self._convert_omegaconf_to_python(item) for item in obj]
+        elif isinstance(obj, dict):
+            return {k: self._convert_omegaconf_to_python(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return type(obj)(self._convert_omegaconf_to_python(item) for item in obj)
+        else:
+            return obj
+
+    def load_checkpoint(self, checkpoint_name: str) -> dict:
+        """Load checkpoint from storage.
+
+        Args:
+            checkpoint_name: Name of the checkpoint file to load.
+
+        Returns:
+            dict: Loaded checkpoint dictionary.
+
+        Raises:
+            ValueError: If the checkpoint cannot be downloaded or loaded.
+        """
+        load_path = self.local_dir / checkpoint_name
+        if self.log_to_cloud:
+            download_url = self._get_checkpoint_download_url(checkpoint_name)
+            with Session() as session:
+                response = session.get(download_url)
+            if response.status_code != 200:
+                raise ValueError(
+                    f"Failed to download checkpoint {checkpoint_name}: {response.text}"
+                )
+            with open(load_path, "wb") as f:
+                f.write(response.content)
+
+        return torch.load(load_path, weights_only=True)
+
+    def delete_checkpoint(self, relative_checkpoint_path: Path) -> None:
+        """Delete checkpoint from storage.
+
+        Args:
+            relative_checkpoint_path: Relative path of the checkpoint file to delete.
+        """
+        checkpoint_path = self.local_dir / relative_checkpoint_path
+        if checkpoint_path.exists():
+            checkpoint_path.unlink()
+        if self.log_to_cloud:
+            response = self._delete_request(
+                f"{API_URL}/org/{self.org_id}/training/jobs/{self.training_job_id}/checkpoints/{relative_checkpoint_path.name}"
+            )
+            if response.status_code != 200:
+                logger.error(
+                    f"Failed to delete checkpoint {relative_checkpoint_path} "
+                    f"from cloud: {response.text}"
+                )
+                return
+
+    def save_model_artifacts(self, model: nn.Module, output_dir: Path) -> None:
+        """Save model artifacts to storage.
+
+        Args:
+            model: PyTorch model to save.
+            output_dir: Directory to save the artifacts.
+        """
+        artifacts_dir = self.local_dir / output_dir / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        create_nc_archive(
+            model=model,
+            output_dir=artifacts_dir,
+            algorithm_config=self.algorithm_config,
+            input_cross_embodiment_description=self.input_cross_embodiment_description,
+            output_cross_embodiment_description=self.output_cross_embodiment_description,
+            input_preprocessing_config=self.input_preprocessing_config,
+            output_preprocessing_config=self.output_preprocessing_config,
+        )
+        if self.log_to_cloud:
+            for file_path in artifacts_dir.glob("*"):
+                upload_url = self._get_upload_url(
+                    filepath=str(file_path.name),
+                    content_type="application/octet-stream",
+                )
+                with open(file_path, "rb") as f:
+                    response = self._put_request(
+                        upload_url,
+                        data=f,
+                        headers={"Content-Type": "application/octet-stream"},
+                    )
+                if response.status_code != 200:
+                    logger.error(
+                        f"Failed to save artifact {file_path} to cloud: {response.text}"
+                    )
+
+    def _execute_upload(
+        self,
+        upload_url: str,
+        data: bytes | IO[bytes],
+        content_type: str,
+    ) -> requests.Response:
+        return self._put_request(
+            upload_url,
+            data=data,
+            headers={"Content-Type": content_type},
+        )
+
+    def update_training_progress(self, epoch: int, step: int) -> None:
+        """Update training epoch/step progress in cloud storage.
+
+        Args:
+            epoch: Current training epoch.
+            step: Current training step.
+        """
+        if self.log_to_cloud:
+            response = self._put_request(
+                f"{API_URL}/org/{self.org_id}/training/jobs/{self.training_job_id}/update",
+                json={"epoch": epoch, "step": step, "error": None},
+            )
+            if response.status_code != 200:
+                logger.error(
+                    f"Failed to update training progress to cloud: {response.text}"
+                )
+
+    def report_training_error(self, error: str) -> None:
+        """Report a training failure to cloud storage.
+
+        This should be called in exactly one place — the top-level error
+        handler in train.py — so that every failure is surfaced regardless
+        of where in the training pipeline it originated.
+
+        Args:
+            error: Formatted error / traceback string to persist.
+        """
+        if self.log_to_cloud:
+            response = self._put_request(
+                f"{API_URL}/org/{self.org_id}/training/jobs/{self.training_job_id}/update",
+                json={"epoch": None, "step": None, "error": error},
+            )
+            if response.status_code != 200:
+                logger.error(
+                    f"Failed to report training error to cloud: {response.text}"
+                )
+
+    def _put_request(
+        self,
+        url: str,
+        json: dict | None = None,
+        data: Any | None = None,
+        headers: dict | None = None,
+    ) -> requests.Response:
+        """Helper method to send a PUT request.
+
+        Args:
+            url: The URL to send the request to.
+            json: The JSON payload to include in the request.
+            data: Optional data to include in the request body.
+            headers: Optional headers to include in the request.
+        """
+        headers = headers or get_auth().get_headers()
+        with Session() as session:
+            response = session.put(url, headers=headers, json=json, data=data)
+            if response.status_code == 401:
+                logger.warning("Unauthorized request. Token may have expired.")
+                nc.login()
+                response = session.put(url, headers=headers, json=json, data=data)
+        return response
+
+    def _get_request(self, url: str, params: dict | None = None) -> requests.Response:
+        """Helper method to send a GET request.
+
+        Args:
+            url: The URL to send the request to.
+            params: Optional parameters to include in the request.
+        """
+        with Session() as session:
+            response = session.get(url, headers=get_auth().get_headers(), params=params)
+            if response.status_code == 401:
+                logger.warning("Unauthorized request. Token may have expired.")
+                nc.login()
+                response = session.get(
+                    url, headers=get_auth().get_headers(), params=params
+                )
+        return response
+
+    def _delete_request(self, url: str) -> requests.Response:
+        """Helper method to send a DELETE request.
+
+        Args:
+            url: The URL to send the request to.
+        """
+        with Session() as session:
+            response = session.delete(url, headers=get_auth().get_headers())
+            if response.status_code == 401:
+                logger.warning("Unauthorized request. Token may have expired.")
+                nc.login()
+                response = session.delete(url, headers=get_auth().get_headers())
+        return response

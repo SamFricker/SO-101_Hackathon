@@ -1,0 +1,691 @@
+"""Tests for core endpoint functionality.
+
+This module tests the DirectPolicy and other core endpoint classes.
+"""
+
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+import pytest
+import torch
+from neuracore_types import (
+    DATA_TYPE_TO_NC_DATA_CLASS,
+    BatchedJointData,
+    DataType,
+    JointData,
+    RGBCameraData,
+    SynchronizedPoint,
+)
+
+import neuracore as nc
+from neuracore.core.const import API_URL
+from neuracore.core.endpoint import DirectPolicy
+
+TEST_API_KEY = "test_api_key"
+
+
+def _ordered_names(names_or_mapping):
+    """Return sensor names in configured order for test fixtures."""
+    if isinstance(names_or_mapping, dict):
+        return [
+            name
+            for _, name in sorted(
+                names_or_mapping.items(), key=lambda item: int(item[0])
+            )
+        ]
+    return list(names_or_mapping)
+
+
+def _indexed_names(*names: str) -> dict[int, str]:
+    """Return explicitly indexed names for embodiment descriptions."""
+    return {index: name for index, name in enumerate(names)}
+
+
+def _mock_policy_output(output_embodiment_description):
+    """Build a named policy output from an embodiment description."""
+    output = {}
+    for data_type, names_or_mapping in output_embodiment_description.items():
+        output[data_type] = {
+            name: BatchedJointData(value=torch.zeros((1, 3, 1)))
+            for name in _ordered_names(names_or_mapping)
+        }
+    return output
+
+
+@pytest.fixture
+def mock_model_path(tmp_path):
+    """Create a mock model file path."""
+    model_file = tmp_path / "model.nc.zip"
+    model_file.touch()
+    return model_file
+
+
+@pytest.fixture
+def mock_policy_inference():
+    """Create a mock PolicyInference object."""
+    mock_policy = MagicMock()
+    mock_policy.input_embodiment_description = {}
+    mock_policy.output_embodiment_description = {}
+    mock_policy.return_value = _mock_policy_output(
+        {DataType.JOINT_TARGET_POSITIONS: {0: "joint1"}}
+    )
+    return mock_policy
+
+
+@pytest.fixture
+def sample_sync_point_with_multiple_data_types():
+    """Create a SynchronizedPoint with multiple data types."""
+    return SynchronizedPoint(
+        timestamp=1234567890.0,
+        data={
+            DataType.JOINT_POSITIONS: {
+                "joint1": JointData(timestamp=1234567890.0, value=0.1),
+                "joint2": JointData(timestamp=1234567890.0, value=0.2),
+            },
+            DataType.JOINT_VELOCITIES: {
+                "joint1": JointData(timestamp=1234567890.0, value=0.01),
+            },
+            DataType.RGB_IMAGES: {
+                "camera1": RGBCameraData(
+                    timestamp=1234567890.0,
+                    frame=np.zeros((100, 100, 3), dtype=np.uint8),
+                    extrinsics=np.eye(4, dtype=np.float16),
+                    intrinsics=np.eye(3, dtype=np.float16),
+                ),
+                "camera2": RGBCameraData(
+                    timestamp=1234567890.0,
+                    frame=np.ones((100, 100, 3), dtype=np.uint8),
+                    extrinsics=np.eye(4, dtype=np.float16),
+                    intrinsics=np.eye(3, dtype=np.float16),
+                ),
+            },
+            DataType.JOINT_TORQUES: {
+                "joint1": JointData(timestamp=1234567890.0, value=1.0),
+            },
+        },
+    )
+
+
+@patch("neuracore.ml.utils.policy_inference.PolicyInference")
+def test_predict_filters_to_input_embodiment_description_only(
+    mock_policy_inference_class,
+    mock_model_path,
+    sample_sync_point_with_multiple_data_types,
+):
+    """Test _predict only includes data types from input_embodiment_description."""
+    # Setup: Model only expects JOINT_POSITIONS and RGB_IMAGES
+    input_embodiment_description = {
+        DataType.JOINT_POSITIONS: _indexed_names("joint1", "joint2"),
+        DataType.RGB_IMAGES: _indexed_names("camera1"),
+    }
+    output_embodiment_description = {
+        DataType.JOINT_TARGET_POSITIONS: _indexed_names("joint1"),
+    }
+
+    # Create mock PolicyInference instance
+    mock_policy = MagicMock()
+    mock_policy.input_embodiment_description = input_embodiment_description
+    mock_policy.output_embodiment_description = output_embodiment_description
+    mock_policy.return_value = _mock_policy_output(output_embodiment_description)
+    mock_policy_inference_class.return_value = mock_policy
+
+    # Create DirectPolicy
+    policy = DirectPolicy(
+        input_embodiment_description=input_embodiment_description,
+        output_embodiment_description=output_embodiment_description,
+        model_path=mock_model_path,
+        org_id="test_org",
+    )
+
+    # Call _predict with sync point containing more data types than model expects
+    policy._predict(sample_sync_point_with_multiple_data_types)
+
+    # Verify that PolicyInference was called
+    assert mock_policy.call_count == 1
+
+    # Get the sync point that was passed to PolicyInference
+    called_sync_point = mock_policy.call_args[0][0]
+
+    # Verify only expected data types are present
+    assert DataType.JOINT_POSITIONS in called_sync_point.data
+    assert DataType.RGB_IMAGES in called_sync_point.data
+
+    # Verify filtered out data types are NOT present
+    assert DataType.JOINT_VELOCITIES not in called_sync_point.data
+    assert DataType.JOINT_TORQUES not in called_sync_point.data
+
+    # Verify the original sync point was mutated (data was filtered in place)
+    assert DataType.JOINT_POSITIONS in sample_sync_point_with_multiple_data_types.data
+    assert DataType.RGB_IMAGES in sample_sync_point_with_multiple_data_types.data
+    assert (
+        DataType.JOINT_VELOCITIES not in sample_sync_point_with_multiple_data_types.data
+    )
+    assert DataType.JOINT_TORQUES not in sample_sync_point_with_multiple_data_types.data
+
+    # Verify the data content is preserved for filtered types
+    assert (
+        called_sync_point.data[DataType.JOINT_POSITIONS]["joint1"]
+        == sample_sync_point_with_multiple_data_types.data[DataType.JOINT_POSITIONS][
+            "joint1"
+        ]
+    )
+    assert (
+        called_sync_point.data[DataType.RGB_IMAGES]["camera1"]
+        == sample_sync_point_with_multiple_data_types.data[DataType.RGB_IMAGES][
+            "camera1"
+        ]
+    )
+
+
+@patch("neuracore.ml.utils.policy_inference.PolicyInference")
+@patch("neuracore.core.endpoint.get_latest_sync_point")
+def test_predict_filters_when_sync_point_is_none(
+    mock_get_latest_sync_point,
+    mock_policy_inference_class,
+    mock_model_path,
+    sample_sync_point_with_multiple_data_types,
+):
+    """Test _predict filters as expected when sync_point is None."""
+    # Setup: Model only expects JOINT_POSITIONS
+    input_embodiment_description = {
+        DataType.JOINT_POSITIONS: _indexed_names("joint1", "joint2"),
+    }
+    output_embodiment_description = {
+        DataType.JOINT_TARGET_POSITIONS: _indexed_names("joint1"),
+    }
+
+    # Mock get_latest_sync_point to return sync point with multiple data types
+    mock_get_latest_sync_point.return_value = sample_sync_point_with_multiple_data_types
+
+    # Create mock PolicyInference instance
+    mock_policy = MagicMock()
+    mock_policy.input_embodiment_description = input_embodiment_description
+    mock_policy.output_embodiment_description = output_embodiment_description
+    mock_policy.return_value = _mock_policy_output(output_embodiment_description)
+    mock_policy_inference_class.return_value = mock_policy
+
+    # Create DirectPolicy
+    policy = DirectPolicy(
+        input_embodiment_description=input_embodiment_description,
+        output_embodiment_description=output_embodiment_description,
+        model_path=mock_model_path,
+        org_id="test_org",
+    )
+
+    # Call _predict with None sync point
+    policy._predict(sync_point=None)
+
+    # Verify get_latest_sync_point was called
+    assert mock_get_latest_sync_point.call_count == 1
+
+    # Verify that PolicyInference was called
+    assert mock_policy.call_count == 1
+
+    # Get the sync point that was passed to PolicyInference
+    called_sync_point = mock_policy.call_args[0][0]
+
+    # Verify only expected data types are present
+    assert DataType.JOINT_POSITIONS in called_sync_point.data
+
+    # Verify filtered out data types are NOT present
+    assert DataType.JOINT_VELOCITIES not in called_sync_point.data
+    assert DataType.RGB_IMAGES not in called_sync_point.data
+    assert DataType.JOINT_TORQUES not in called_sync_point.data
+
+
+@patch("neuracore.ml.utils.policy_inference.PolicyInference")
+def test_predict_filters_when_sync_point_missing_expected_data_types(
+    mock_policy_inference_class,
+    mock_model_path,
+):
+    """Test _predict skips missing model-required data types gracefully."""
+    # Setup: Model expects JOINT_POSITIONS and RGB_IMAGES
+    input_embodiment_description = {
+        DataType.JOINT_POSITIONS: _indexed_names("joint1"),
+        DataType.RGB_IMAGES: _indexed_names("camera1"),
+    }
+    output_embodiment_description = {
+        DataType.JOINT_TARGET_POSITIONS: _indexed_names("joint1"),
+    }
+
+    # Create sync point with only JOINT_POSITIONS (missing RGB_IMAGES)
+    sync_point = SynchronizedPoint(
+        timestamp=1234567890.0,
+        data={
+            DataType.JOINT_POSITIONS: {
+                "joint1": JointData(timestamp=1234567890.0, value=0.1),
+            },
+        },
+    )
+
+    # Create mock PolicyInference instance
+    mock_policy = MagicMock()
+    mock_policy.input_embodiment_description = input_embodiment_description
+    mock_policy.output_embodiment_description = output_embodiment_description
+    mock_policy.return_value = _mock_policy_output(output_embodiment_description)
+    mock_policy_inference_class.return_value = mock_policy
+
+    # Create DirectPolicy
+    policy = DirectPolicy(
+        input_embodiment_description=input_embodiment_description,
+        output_embodiment_description=output_embodiment_description,
+        model_path=mock_model_path,
+        org_id="test_org",
+    )
+
+    # Call _predict - should filter to only include JOINT_POSITIONS
+    policy._predict(sync_point)
+
+    # Get the sync point that was passed to PolicyInference
+    called_sync_point = mock_policy.call_args[0][0]
+
+    # Verify only available data type is present
+    assert DataType.JOINT_POSITIONS in called_sync_point.data
+    assert DataType.RGB_IMAGES not in called_sync_point.data
+
+
+@patch("neuracore.ml.utils.policy_inference.PolicyInference")
+def test_predict_filters_with_empty_input_embodiment_description(
+    mock_policy_inference_class,
+    mock_model_path,
+    sample_sync_point_with_multiple_data_types,
+):
+    """Test that _predict handles empty input_embodiment_description correctly."""
+    # Setup: Model expects no inputs (edge case)
+    input_embodiment_description = {}
+    output_embodiment_description = {
+        DataType.JOINT_TARGET_POSITIONS: {"0": "joint1"},
+    }
+
+    # Create mock PolicyInference instance
+    mock_policy = MagicMock()
+    mock_policy.input_embodiment_description = input_embodiment_description
+    mock_policy.output_embodiment_description = output_embodiment_description
+    mock_policy.return_value = _mock_policy_output(output_embodiment_description)
+    mock_policy_inference_class.return_value = mock_policy
+
+    # Create DirectPolicy
+    policy = DirectPolicy(
+        input_embodiment_description=input_embodiment_description,
+        output_embodiment_description=output_embodiment_description,
+        model_path=mock_model_path,
+        org_id="test_org",
+    )
+
+    # Call _predict
+    policy._predict(sample_sync_point_with_multiple_data_types)
+
+    # Get the sync point that was passed to PolicyInference
+    called_sync_point = mock_policy.call_args[0][0]
+
+    # Verify sync point has no data (all filtered out)
+    assert len(called_sync_point.data) == 0
+
+
+@patch("neuracore.ml.utils.policy_inference.PolicyInference")
+def test_predict_filters_preserves_all_sensors_for_selected_data_types(
+    mock_policy_inference_class,
+    mock_model_path,
+):
+    """Test that filtering preserves all sensors/labels for selected data types."""
+    # Setup: Model expects JOINT_POSITIONS with multiple joints
+    input_embodiment_description = {
+        DataType.JOINT_POSITIONS: {0: "joint1", 1: "joint2", 2: "joint3"},
+        DataType.RGB_IMAGES: {0: "camera1", 1: "camera2"},
+    }
+    output_embodiment_description = {
+        DataType.JOINT_TARGET_POSITIONS: {0: "joint1"},
+    }
+
+    # Create sync point with multiple sensors per data type
+    sync_point = SynchronizedPoint(
+        timestamp=1234567890.0,
+        data={
+            DataType.JOINT_POSITIONS: {
+                "joint1": JointData(timestamp=1234567890.0, value=0.1),
+                "joint2": JointData(timestamp=1234567890.0, value=0.2),
+                "joint3": JointData(timestamp=1234567890.0, value=0.3),
+            },
+            DataType.RGB_IMAGES: {
+                "camera1": RGBCameraData(
+                    timestamp=1234567890.0,
+                    frame=np.zeros((100, 100, 3), dtype=np.uint8),
+                    extrinsics=np.eye(4, dtype=np.float16),
+                    intrinsics=np.eye(3, dtype=np.float16),
+                ),
+                "camera2": RGBCameraData(
+                    timestamp=1234567890.0,
+                    frame=np.ones((100, 100, 3), dtype=np.uint8),
+                    extrinsics=np.eye(4, dtype=np.float16),
+                    intrinsics=np.eye(3, dtype=np.float16),
+                ),
+            },
+            DataType.JOINT_VELOCITIES: {
+                "joint1": JointData(timestamp=1234567890.0, value=0.01),
+            },
+        },
+    )
+
+    # Create mock PolicyInference instance
+    mock_policy = MagicMock()
+    mock_policy.input_embodiment_description = input_embodiment_description
+    mock_policy.output_embodiment_description = output_embodiment_description
+    mock_policy.return_value = _mock_policy_output(output_embodiment_description)
+    mock_policy_inference_class.return_value = mock_policy
+
+    # Create DirectPolicy
+    policy = DirectPolicy(
+        input_embodiment_description=input_embodiment_description,
+        output_embodiment_description=output_embodiment_description,
+        model_path=mock_model_path,
+        org_id="test_org",
+    )
+
+    # Call _predict
+    policy._predict(sync_point)
+
+    # Get the sync point that was passed to PolicyInference
+    called_sync_point = mock_policy.call_args[0][0]
+
+    # Verify all sensors for selected data types are preserved
+    assert len(called_sync_point.data[DataType.JOINT_POSITIONS]) == 3
+    assert "joint1" in called_sync_point.data[DataType.JOINT_POSITIONS]
+    assert "joint2" in called_sync_point.data[DataType.JOINT_POSITIONS]
+    assert "joint3" in called_sync_point.data[DataType.JOINT_POSITIONS]
+
+    assert len(called_sync_point.data[DataType.RGB_IMAGES]) == 2
+    assert "camera1" in called_sync_point.data[DataType.RGB_IMAGES]
+    assert "camera2" in called_sync_point.data[DataType.RGB_IMAGES]
+
+    # Verify filtered out data type is not present
+    assert DataType.JOINT_VELOCITIES not in called_sync_point.data
+
+
+@patch("neuracore.ml.utils.policy_inference.PolicyInference")
+@patch("neuracore.core.endpoint.get_latest_sync_point")
+def test_predict_filters_multiple_streams_logged_scenario(
+    mock_get_latest_sync_point,
+    mock_policy_inference_class,
+    mock_model_path,
+):
+    """Test filtering when multiple streams are logged but only a subset is selected.
+
+    This simulates the real-world scenario where:
+    1. Multiple data streams are logged (joint positions, velocities, images, etc.)
+    2. Model only expects a subset (e.g., just joint positions and one camera)
+    3. Only the expected subset should be passed to the model
+    """
+    # Setup: Model only expects JOINT_POSITIONS and one RGB camera
+    input_embodiment_description = {
+        DataType.JOINT_POSITIONS: {0: "arm_joint1", 1: "arm_joint2"},
+        DataType.RGB_IMAGES: {0: "top_camera"},
+    }
+    output_embodiment_description = {
+        DataType.JOINT_TARGET_POSITIONS: {0: "arm_joint1", 1: "arm_joint2"},
+    }
+
+    # Create sync point simulating multiple logged streams
+    sync_point_with_all_streams = SynchronizedPoint(
+        timestamp=1234567890.0,
+        data={
+            DataType.JOINT_POSITIONS: {
+                "arm_joint1": JointData(timestamp=1234567890.0, value=0.1),
+                "arm_joint2": JointData(timestamp=1234567890.0, value=0.2),
+            },
+            DataType.JOINT_VELOCITIES: {
+                "arm_joint1": JointData(timestamp=1234567890.0, value=0.01),
+            },
+            DataType.JOINT_TORQUES: {
+                "arm_joint1": JointData(timestamp=1234567890.0, value=1.0),
+            },
+            DataType.RGB_IMAGES: {
+                "top_camera": RGBCameraData(
+                    timestamp=1234567890.0,
+                    frame=np.zeros((100, 100, 3), dtype=np.uint8),
+                    extrinsics=np.eye(4, dtype=np.float16),
+                    intrinsics=np.eye(3, dtype=np.float16),
+                ),
+                "side_camera": RGBCameraData(
+                    timestamp=1234567890.0,
+                    frame=np.ones((100, 100, 3), dtype=np.uint8),
+                    extrinsics=np.eye(4, dtype=np.float16),
+                    intrinsics=np.eye(3, dtype=np.float16),
+                ),
+            },
+            DataType.DEPTH_IMAGES: {
+                "top_camera": DATA_TYPE_TO_NC_DATA_CLASS[
+                    DataType.DEPTH_IMAGES
+                ].sample(),
+            },
+        },
+    )
+
+    # Mock get_latest_sync_point to return sync point with all streams
+    mock_get_latest_sync_point.return_value = sync_point_with_all_streams
+
+    # Create mock PolicyInference instance
+    mock_policy = MagicMock()
+    mock_policy.input_embodiment_description = input_embodiment_description
+    mock_policy.output_embodiment_description = output_embodiment_description
+    mock_policy.return_value = _mock_policy_output(output_embodiment_description)
+    mock_policy_inference_class.return_value = mock_policy
+
+    # Create DirectPolicy
+    policy = DirectPolicy(
+        input_embodiment_description=input_embodiment_description,
+        output_embodiment_description=output_embodiment_description,
+        model_path=mock_model_path,
+        org_id="test_org",
+    )
+
+    # Call _predict with None (will use get_latest_sync_point)
+    policy._predict(sync_point=None)
+
+    # Verify get_latest_sync_point was called
+    assert mock_get_latest_sync_point.call_count == 1
+
+    # Verify that PolicyInference was called
+    assert mock_policy.call_count == 1
+
+    # Get the sync point that was passed to PolicyInference
+    called_sync_point = mock_policy.call_args[0][0]
+
+    # Verify only expected data types are present
+    assert DataType.JOINT_POSITIONS in called_sync_point.data
+    assert DataType.RGB_IMAGES in called_sync_point.data
+
+    # Verify filtered out data types are NOT present
+    assert DataType.JOINT_VELOCITIES not in called_sync_point.data
+    assert DataType.JOINT_TORQUES not in called_sync_point.data
+    assert DataType.DEPTH_IMAGES not in called_sync_point.data
+
+    # Verify the original sync point was mutated
+    assert DataType.JOINT_POSITIONS in sync_point_with_all_streams.data
+    assert DataType.RGB_IMAGES in sync_point_with_all_streams.data
+    assert DataType.JOINT_VELOCITIES not in sync_point_with_all_streams.data
+    assert DataType.JOINT_TORQUES not in sync_point_with_all_streams.data
+    assert DataType.DEPTH_IMAGES not in sync_point_with_all_streams.data
+
+    # Verify all sensors for selected data types are preserved
+    assert len(called_sync_point.data[DataType.JOINT_POSITIONS]) == 2
+    assert "arm_joint1" in called_sync_point.data[DataType.JOINT_POSITIONS]
+    assert "arm_joint2" in called_sync_point.data[DataType.JOINT_POSITIONS]
+
+    assert (
+        len(called_sync_point.data[DataType.RGB_IMAGES]) == 2
+    )  # Both cameras preserved
+    assert "top_camera" in called_sync_point.data[DataType.RGB_IMAGES]
+    assert "side_camera" in called_sync_point.data[DataType.RGB_IMAGES]
+
+
+@patch("neuracore.ml.utils.policy_inference.PolicyInference")
+def test_predict_filters_with_single_data_type(
+    mock_policy_inference_class,
+    mock_model_path,
+    sample_sync_point_with_multiple_data_types,
+):
+    """Test filtering when model only expects a single data type."""
+    # Setup: Model only expects RGB_IMAGES
+    input_embodiment_description = {
+        DataType.RGB_IMAGES: {0: "camera1", 1: "camera2"},
+    }
+    output_embodiment_description = {
+        DataType.JOINT_TARGET_POSITIONS: {0: "joint1"},
+    }
+
+    # Create mock PolicyInference instance
+    mock_policy = MagicMock()
+    mock_policy.input_embodiment_description = input_embodiment_description
+    mock_policy.output_embodiment_description = output_embodiment_description
+    mock_policy.return_value = _mock_policy_output(output_embodiment_description)
+    mock_policy_inference_class.return_value = mock_policy
+
+    # Create DirectPolicy
+    policy = DirectPolicy(
+        input_embodiment_description=input_embodiment_description,
+        output_embodiment_description=output_embodiment_description,
+        model_path=mock_model_path,
+        org_id="test_org",
+    )
+
+    # Call _predict
+    policy._predict(sample_sync_point_with_multiple_data_types)
+
+    # Get the sync point that was passed to PolicyInference
+    called_sync_point = mock_policy.call_args[0][0]
+
+    # Verify only RGB_IMAGES is present
+    assert DataType.RGB_IMAGES in called_sync_point.data
+    assert len(called_sync_point.data) == 1
+
+    # Verify all other data types are filtered out
+    assert DataType.JOINT_POSITIONS not in called_sync_point.data
+    assert DataType.JOINT_VELOCITIES not in called_sync_point.data
+    assert DataType.JOINT_TORQUES not in called_sync_point.data
+
+
+@patch("neuracore.ml.utils.policy_inference.PolicyInference")
+def test_connect_direct_policy_with_train_run(
+    mock_policy_inference_class,
+    temp_config_dir,
+    mock_auth_requests,
+    reset_neuracore,
+    mocked_org_id,
+):
+    """Test connecting to a direct in-process policy using a training run name."""
+    nc.login(TEST_API_KEY)
+    port = np.random.randint(8000, 9000)
+    localhost = f"http://127.0.0.1:{port}"
+
+    mock_auth_requests.get(
+        f"{API_URL}/org/{mocked_org_id}/training/jobs",
+        json=[{
+            "id": "job_direct_123",
+            "name": "test_run_direct",
+            "status": "completed",
+        }],
+        status_code=200,
+    )
+    mock_auth_requests.get(
+        f"{API_URL}/org/{mocked_org_id}/training/jobs/job_direct_123/model_url",
+        json={"url": f"{localhost}/model.nc.zip"},
+        status_code=200,
+    )
+    mock_auth_requests.get(
+        f"{localhost}/model.nc.zip",
+        content=b"dummy model content",
+        status_code=200,
+    )
+
+    input_embodiment_description = {
+        DataType.JOINT_POSITIONS: _indexed_names(["joint1"]),
+    }
+    output_embodiment_description = {
+        DataType.JOINT_TARGET_POSITIONS: _indexed_names(["joint1"]),
+    }
+
+    mock_policy = MagicMock()
+    mock_policy.input_embodiment_description = input_embodiment_description
+    mock_policy.return_value = {
+        DataType.JOINT_TARGET_POSITIONS: {
+            "joint1": BatchedJointData(value=torch.full((1, 1, 1), 0.1))
+        }
+    }
+    mock_policy_inference_class.return_value = mock_policy
+
+    direct_policy = nc.policy(
+        input_embodiment_description=input_embodiment_description,
+        output_embodiment_description=output_embodiment_description,
+        train_run_name="test_run_direct",
+    )
+
+    preds = direct_policy.predict(
+        sync_point=SynchronizedPoint(
+            timestamp=1234567890.0,
+            data={
+                DataType.JOINT_POSITIONS: {
+                    "joint1": JointData(timestamp=1234567890.0, value=0.1),
+                },
+            },
+        )
+    )
+    assert DataType.JOINT_TARGET_POSITIONS in preds
+    assert "joint1" in preds[DataType.JOINT_TARGET_POSITIONS]
+
+    assert mock_policy_inference_class.call_args.kwargs["job_id"] == "job_direct_123"
+
+
+@patch("neuracore.ml.utils.policy_inference.PolicyInference")
+def test_connect_direct_policy_with_model_file(
+    mock_policy_inference_class,
+    temp_config_dir,
+    mock_model_mar,
+    mock_auth_requests,
+    reset_neuracore,
+):
+    """Test connecting to a direct in-process policy using a local model file."""
+    nc.login(TEST_API_KEY)
+
+    input_embodiment_description = {
+        DataType.JOINT_POSITIONS: _indexed_names(["joint1"]),
+    }
+    output_embodiment_description = {
+        DataType.JOINT_TARGET_POSITIONS: _indexed_names(["joint1"]),
+    }
+
+    mock_policy = MagicMock()
+    mock_policy.input_embodiment_description = input_embodiment_description
+    mock_policy.return_value = {
+        DataType.JOINT_TARGET_POSITIONS: {
+            "joint1": BatchedJointData(value=torch.full((1, 1, 1), 0.1))
+        }
+    }
+    mock_policy_inference_class.return_value = mock_policy
+
+    direct_policy = nc.policy(
+        input_embodiment_description=input_embodiment_description,
+        output_embodiment_description=output_embodiment_description,
+        model_file=mock_model_mar,
+    )
+
+    sync_point = SynchronizedPoint(
+        timestamp=1234567890.0,
+        data={
+            DataType.JOINT_POSITIONS: {
+                "joint1": JointData(timestamp=1234567890.0, value=0.1),
+            },
+            DataType.JOINT_TARGET_POSITIONS: {
+                "joint1": JointData(timestamp=1234567890.0, value=0.9),
+            },
+        },
+    )
+
+    preds = direct_policy.predict(sync_point=sync_point)
+    assert preds == {
+        DataType.JOINT_TARGET_POSITIONS: {
+            "joint1": BatchedJointData(value=torch.full((1, 1, 1), 0.1))
+        }
+    }
+
+    called_sync_point = mock_policy.call_args[0][0]
+    assert set(called_sync_point.data.keys()) == {DataType.JOINT_POSITIONS}

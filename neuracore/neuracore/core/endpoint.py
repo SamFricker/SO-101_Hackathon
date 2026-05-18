@@ -1,0 +1,844 @@
+"""Model endpoint management for robot control and inference.
+
+This module provides classes and functions for connecting to and interacting
+with machine learning model endpoints, both local and remote. It handles
+model prediction requests, data synchronization from robot sensors, and
+manages FastAPI instance for local model deployment.
+"""
+
+import atexit
+import json
+import logging
+import os
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from subprocess import Popen
+from typing import TYPE_CHECKING
+
+import requests
+from neuracore_types import DataType, EmbodimentDescription, SynchronizedPoint
+
+from neuracore.core.utils.http_session import Session
+
+if TYPE_CHECKING:
+    from neuracore_types import BatchedNCData
+
+from neuracore.core.config.get_current_org import get_current_org
+from neuracore.core.exceptions import InsufficientSynchronizedPointError
+from neuracore.core.get_latest_sync_point import get_latest_sync_point
+from neuracore.core.utils.download import download_with_progress
+from neuracore.ml.logging.endpoint_log_streamer import EndpointLogStreamer
+from neuracore.ml.utils.endpoint_storage_handler import EndpointStorageHandler
+from neuracore.ml.utils.preprocessing_utils import PreprocessingConfiguration
+
+from .auth import get_auth
+from .const import API_URL, PING_ENDPOINT, PREDICT_ENDPOINT, SET_CHECKPOINT_ENDPOINT
+from .exceptions import EndpointError
+
+logger = logging.getLogger(__name__)
+
+PREDICTION_WAIT_TIME = 0.1
+
+
+def _parse_embodiment_description(raw_description: dict) -> EmbodimentDescription:
+    """Parse an API embodiment description, restoring typed keys."""
+    return {
+        DataType(data_type): {int(index): name for index, name in indexed_names.items()}
+        for data_type, indexed_names in raw_description.items()
+    }
+
+
+class Policy:
+    """Base class for all policies."""
+
+    def set_checkpoint(
+        self, epoch: int | None = None, checkpoint_file: str | None = None
+    ) -> None:
+        """Set the model checkpoint to use for inference.
+
+        Args:
+            epoch: The epoch number of the checkpoint to load.
+            checkpoint_file: Optional path to a specific checkpoint file.
+                If provided, overrides the epoch setting.
+        """
+        if epoch is not None and checkpoint_file is not None:
+            raise ValueError("Specify either epoch or checkpoint_file, not both.")
+        if epoch is None and checkpoint_file is None:
+            raise ValueError("Must specify either epoch or checkpoint_file.")
+
+    def predict(
+        self,
+        sync_point: SynchronizedPoint | None = None,
+        timeout: float = 5,
+    ) -> dict[DataType, dict[str, "BatchedNCData"]]:
+        """Get action predictions from the model.
+
+        Sends robot sensor data to the model and receives action predictions.
+        Automatically creates a sync point from current robot data if none
+        is provided.
+
+        Args:
+            sync_point: Synchronized sensor data to send to the model. If None,
+                creates a new sync point from the robot's current sensor data.
+            timeout: Maximum time to wait (in seconds) to accumulate asynchronous
+                sensor data. Raises error if timeout is reached without sufficient data.
+
+        Returns:
+            Model predictions as dict[DataType, dict[str, "BatchedNCData"]].
+
+        Raises:
+            InsufficientSynchronizedPointError:
+                If the sync point doesn't contain required data.
+            EndpointError: If prediction request fails or response is invalid.
+        """
+        if timeout <= 0:
+            raise ValueError("Timeout must be a positive number.")
+        t = time.time()
+        prediction = None
+        while prediction is None:
+            try:
+                prediction = self._predict(sync_point)
+            except InsufficientSynchronizedPointError as e:
+                if time.time() - t > timeout:
+                    raise e
+                time.sleep(PREDICTION_WAIT_TIME)
+        return prediction
+
+    def disconnect(self) -> None:
+        """Disconnect from the policy and clean up resources."""
+        pass
+
+    def _predict(
+        self,
+        sync_point: SynchronizedPoint | None = None,
+    ) -> dict[DataType, dict[str, "BatchedNCData"]]:
+        """Internal get action predictions from the model.
+
+        Sends robot sensor data to the model and receives action predictions.
+        Automatically creates a sync point from current robot data if none
+        is provided.
+
+        Args:
+            sync_point: Synchronized sensor data to send to the model. If None,
+                creates a new sync point from the robot's current sensor data.
+
+        Returns:
+            Model predictions as dict[DataType, dict[str, "BatchedNCData"]].
+        """
+        raise NotImplementedError(
+            "Subclasses must implement the _predict method to run model inference."
+        )
+
+
+class DirectPolicy(Policy):
+    """Direct model inference without any server infrastructure.
+
+    This policy loads the model directly in the current process and runs
+    inference without any network overhead. Ideal for low-latency applications.
+    """
+
+    def __init__(
+        self,
+        model_path: Path,
+        org_id: str,
+        input_embodiment_description: EmbodimentDescription | None = None,
+        output_embodiment_description: EmbodimentDescription | None = None,
+        input_preprocessing_config: PreprocessingConfiguration | None = None,
+        job_id: str | None = None,
+        device: str | None = None,
+        robot_id: str | None = None,
+    ):
+        """Initialize the direct policy with a robot instance."""
+        super().__init__()
+        # Import here to avoid the need for pytorch unless the user uses this policy
+        from neuracore.ml.utils.policy_inference import PolicyInference
+
+        self._policy = PolicyInference(
+            input_embodiment_description=input_embodiment_description,
+            output_embodiment_description=output_embodiment_description,
+            input_preprocessing_config=input_preprocessing_config,
+            org_id=org_id,
+            job_id=job_id,
+            model_file=model_path,
+            device=device,
+            robot_id=robot_id,
+        )
+
+    def set_checkpoint(
+        self, epoch: int | None = None, checkpoint_file: str | None = None
+    ) -> None:
+        """Set the model checkpoint to use for inference.
+
+        Args:
+            epoch: The epoch number of the checkpoint to load.
+            checkpoint_file: Optional path to a specific checkpoint file.
+                If provided, overrides the epoch setting.
+        """
+        super().set_checkpoint(epoch, checkpoint_file)
+        self._policy.set_checkpoint(epoch, checkpoint_file)
+
+    def _predict(
+        self,
+        sync_point: SynchronizedPoint | None = None,
+    ) -> dict[DataType, dict[str, "BatchedNCData"]]:
+        """Run direct model inference.
+
+        Args:
+            sync_point: Optional sync point. If None, creates from robot sensors.
+
+        Returns:
+            Model predictions as dict[DataType, dict[str, "BatchedNCData"]].
+
+        Raises:
+            InsufficientSynchronizedPointError:
+                If the sync point doesn't contain required data.
+        """
+        if sync_point is None:
+            sync_point = get_latest_sync_point()
+
+        # Filter sync point to only include data types the model expects as input
+        filtered_data = {
+            data_type: sync_point.data[data_type]
+            for data_type in self._policy.input_embodiment_description.keys()
+            if data_type in sync_point.data
+        }
+        sync_point.data = filtered_data
+
+        return self._policy(sync_point)
+
+
+class ServerPolicy(Policy):
+    """Base class for server-based policies that communicate via HTTP.
+
+    This class provides common functionality for policies that send requests
+    to HTTP endpoints, whether local or remote.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        headers: dict[str, str] | None = None,
+        input_embodiment_description: EmbodimentDescription | None = None,
+    ):
+        """Initialize the server policy with connection details.
+
+        Args:
+            robot: Robot instance for accessing sensor streams.
+            base_url: Base URL of the server.
+            headers: Optional HTTP headers for authentication.
+            input_embodiment_description: Optional input spec used to project
+                local sync points before sending them to the server.
+        """
+        super().__init__()
+        self._base_url = base_url
+        self._headers = headers or {}
+        self._input_embodiment_description = input_embodiment_description
+        self._is_local = "localhost" in base_url or "127.0.0.1" in base_url
+
+    def set_checkpoint(
+        self, epoch: int | None = None, checkpoint_file: str | None = None
+    ) -> None:
+        """Set the model checkpoint via HTTP request.
+
+        Args:
+            epoch: The epoch number of the checkpoint to load.
+            checkpoint_file: Optional path to a specific checkpoint file.
+                If provided, overrides the epoch setting.
+        """
+        if checkpoint_file is not None:
+            raise ValueError(
+                "Setting checkpoint by file is not supported in server policies."
+            )
+        if epoch is None:
+            raise ValueError("Must specify epoch to set checkpoint.")
+        if epoch < -1:
+            raise ValueError("Epoch must be -1 (last) or a non-negative integer.")
+        try:
+            with Session() as session:
+                response = session.post(
+                    f"{self._base_url}{SET_CHECKPOINT_ENDPOINT}",
+                    headers=self._headers,
+                    json={"epoch": epoch},
+                    timeout=30,
+                )
+            if response.status_code != 200:
+                raise EndpointError(
+                    "Failed to set checkpoint: "
+                    f"{response.status_code} - {response.text}"
+                )
+            response.raise_for_status()
+        except requests.exceptions.ConnectionError:
+            raise EndpointError(
+                "Failed to connect to endpoint, "
+                "please check your internet connection and try again."
+            )
+        except requests.exceptions.RequestException as e:
+            raise EndpointError(f"Failed to set checkpoint: {str(e)}")
+
+    def _predict(
+        self,
+        sync_point: SynchronizedPoint | None = None,
+    ) -> dict[DataType, dict[str, "BatchedNCData"]]:
+        """Get action predictions from the model endpoint.
+
+        Sends robot sensor data to the model and receives action predictions.
+        Automatically creates a sync point from current robot data if none
+        is provided. Handles image encoding and payload size validation.
+
+        Args:
+            sync_point: Synchronized sensor data to send to the model. If None,
+                creates a new sync point from the robot's current sensor data.
+
+        Returns:
+            Model predictions including actions and any generated outputs.
+
+        Raises:
+            InsufficientSynchronizedPointError:
+                If the sync point doesn't contain required data.
+            ValueError: If payload size exceeds limits for remote endpoints.
+        """
+        # Lazy import to avoid torch dependency at module load time
+        from neuracore_types import DATA_TYPE_TO_BATCHED_NC_DATA_CLASS
+
+        if sync_point is None:
+            sync_point = get_latest_sync_point()
+        if self._input_embodiment_description is not None:
+            filtered_data = {
+                data_type: sync_point.data[data_type]
+                for data_type in self._input_embodiment_description.keys()
+                if data_type in sync_point.data
+            }
+            sync_point.data = filtered_data
+        response = None
+        try:
+            with Session() as session:
+                response = session.post(
+                    f"{self._base_url}{PREDICT_ENDPOINT}",
+                    headers=self._headers,
+                    json=sync_point.model_dump(mode="json"),
+                    timeout=int(os.getenv("NEURACORE_ENDPOINT_TIMEOUT", 10)),
+                )
+            response.raise_for_status()
+            result = response.json()
+            sync_point_preds = {
+                DataType(data_type): {
+                    key: DATA_TYPE_TO_BATCHED_NC_DATA_CLASS[data_type].model_validate(
+                        value
+                    )
+                    for key, value in data_type_dict.items()
+                }
+                for data_type, data_type_dict in result.items()
+            }
+            return sync_point_preds
+        except requests.exceptions.ConnectionError:
+            raise EndpointError(
+                "Failed to connect to endpoint, "
+                "please check your internet connection and try again."
+            )
+        except requests.exceptions.RequestException as e:
+            if response is not None:
+                if response.status_code == 422:
+                    raise InsufficientSynchronizedPointError(
+                        "Insufficient sync point data for inference."
+                    )
+                raise EndpointError(
+                    "Failed to get prediction from endpoint: "
+                    f"{response.json().get('detail', 'Unknown error')}"
+                )
+            raise EndpointError(f"Failed to get prediction from endpoint: {str(e)}")
+        except Exception as e:
+            raise EndpointError(f"Error processing endpoint response: {str(e)}")
+
+
+class LocalServerPolicy(ServerPolicy):
+    """Policy that manages a local FastAPI server instance.
+
+    This policy starts and manages a local FastAPI server for model inference,
+    providing the flexibility of a server architecture with local control.
+    """
+
+    def __init__(
+        self,
+        org_id: str,
+        model_path: Path,
+        input_embodiment_description: EmbodimentDescription | None = None,
+        output_embodiment_description: EmbodimentDescription | None = None,
+        input_preprocessing_config: PreprocessingConfiguration | None = None,
+        device: str | None = None,
+        job_id: str | None = None,
+        port: int = 8080,
+        host: str = "127.0.0.1",
+        endpoint_id: str | None = None,
+        robot_id: str | None = None,
+    ):
+        """Initialize the local server policy.
+
+        Args:
+            input_embodiment_description: Specification of the order that will
+                be fed into the model
+            output_embodiment_description: Specification of the order that will
+                be fed into the model outputs
+            org_id: Organization ID
+            model_path: Path to the .nc.zip model file
+            device: Device model to be loaded on
+            job_id: Optional job ID to associate with the server
+            port: Port to run the server on
+            host: Host to bind to
+            endpoint_id: Optional deployed endpoint ID used for cloud log uploads.
+            robot_id: Optional robot ID used to resolve embodiments from model
+                metadata when explicit embodiments are omitted.
+            input_preprocessing_config: Preprocessing configuration for the input
+                data.
+        """
+        super().__init__(
+            f"http://{host}:{port}",
+            input_embodiment_description=input_embodiment_description,
+        )
+        self.input_embodiment_description = input_embodiment_description
+        self.output_embodiment_description = output_embodiment_description
+        self.input_preprocessing_config = input_preprocessing_config
+        self.robot_id = robot_id
+        self.org_id = org_id
+        self.job_id = job_id
+        self.endpoint_id = endpoint_id
+        self.model_path = model_path
+        self.device = device
+        self.port = port
+        self.host = host
+        self.server_process: Popen | None = None
+        self._log_streamer: EndpointLogStreamer | None = None
+        self._endpoint_log_path: Path | None = None
+        self._startup_status_path: Path | None = None
+        if endpoint_id is not None:
+            output_dir = (
+                Path(tempfile.gettempdir()) / "neuracore" / "endpoints" / endpoint_id
+            )
+            output_dir.mkdir(parents=True, exist_ok=True)
+            self._endpoint_log_path = output_dir / "endpoint.log"
+            self._startup_status_path = output_dir / "startup-status.json"
+            storage_handler = EndpointStorageHandler(endpoint_id=endpoint_id)
+            self._log_streamer = EndpointLogStreamer(
+                storage_handler=storage_handler,
+                output_dir=output_dir,
+            )
+            self._log_streamer.start()
+        else:
+            status_dir = Path(tempfile.gettempdir()) / "neuracore" / "endpoints"
+            status_dir.mkdir(parents=True, exist_ok=True)
+            self._startup_status_path = (
+                status_dir / f"startup-status-{self.host}-{self.port}.json"
+            )
+        atexit.register(self.disconnect)
+        self._start_server()
+
+    def _start_server(self) -> None:
+        """Start the FastAPI server in a subprocess using module execution."""
+        # Start the server process using module execution
+        cmd = [
+            sys.executable,
+            "-m",
+            "neuracore.core.utils.server",
+            "--model-file",
+            str(self.model_path),
+            "--org-id",
+            self.org_id,
+            "--host",
+            self.host,
+            "--port",
+            str(self.port),
+            "--log-level",
+            "info",
+        ]
+        if self.input_embodiment_description is not None:
+            input_embodiment_description_str = json.dumps(
+                {k.value: v for k, v in self.input_embodiment_description.items()}
+            )
+            cmd.extend([
+                "--input-embodiment-description",
+                f"{input_embodiment_description_str}",
+            ])
+        if self.output_embodiment_description is not None:
+            output_embodiment_description_str = json.dumps(
+                {k.value: v for k, v in self.output_embodiment_description.items()}
+            )
+            cmd.extend([
+                "--output-embodiment-description",
+                f"{output_embodiment_description_str}",
+            ])
+        if self.input_preprocessing_config is not None:
+            input_preprocessing_config_serialized = {
+                data_type.value: [m.to_dict() for m in methods]
+                for data_type, methods in self.input_preprocessing_config.items()
+            }
+            cmd.extend([
+                "--input-preprocessing-config",
+                json.dumps(input_preprocessing_config_serialized),
+            ])
+        if self.robot_id is not None:
+            cmd.extend(["--robot-id", self.robot_id])
+        if self.device:
+            cmd.extend(["--device", self.device])
+        if self.job_id:
+            cmd.extend(["--job-id", self.job_id])
+        if self._endpoint_log_path is not None:
+            cmd.extend(["--log-file-path", str(self._endpoint_log_path)])
+        if self._startup_status_path is not None:
+            if self._startup_status_path.exists():
+                self._startup_status_path.unlink()
+            cmd.extend(["--startup-status-file-path", str(self._startup_status_path)])
+
+        if self._is_port_in_use(self.host, self.port):
+            raise EndpointError(
+                f"Port {self.port} is already in use. "
+                "Kill the process using it or choose a different port."
+            )
+
+        logger.info(f"Starting FastAPI server with command: {' '.join(cmd)}")
+        self.server_process = subprocess.Popen(
+            cmd,
+            # Ensure clean process termination
+            preexec_fn=os.setsid if hasattr(os, "setsid") else None,
+        )
+
+        # Wait for server to start
+        self._wait_for_server()
+
+    def _is_port_in_use(self, host: str, port: int) -> bool:
+        """Check if a port is in use on the specified host."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1)
+            return sock.connect_ex((host, port)) == 0
+
+    def _wait_for_server(self, max_attempts: int = 900) -> None:
+        """Wait for the server to become available."""
+        for attempt in range(max_attempts):
+            if (
+                self._startup_status_path is not None
+                and self._startup_status_path.exists()
+            ):
+                try:
+                    status_payload = json.loads(
+                        self._startup_status_path.read_text(encoding="utf-8")
+                    )
+                except Exception:
+                    status_payload = {}
+                if status_payload.get("status") == "error":
+                    error = status_payload.get(
+                        "error", "Unknown server initialization error."
+                    )
+                    raise EndpointError(f"Local server failed to initialize: {error}")
+            # Check if the process has terminated unexpectedly
+            if self.server_process and self.server_process.poll() is not None:
+                raise EndpointError("Local server process terminated unexpectedly.")
+            try:
+                with Session() as session:
+                    response = session.get(
+                        f"http://{self.host}:{self.port}{PING_ENDPOINT}", timeout=1
+                    )
+                if response.status_code == 200:
+                    logger.info(
+                        f"Local server started successfully on {self.host}:{self.port}"
+                    )
+                    return
+            except requests.exceptions.RequestException:
+                pass
+            time.sleep(1)
+
+        raise EndpointError(
+            f"Local server failed to start after {max_attempts} attempts"
+        )
+
+    def set_checkpoint(
+        self, epoch: int | None = None, checkpoint_file: str | None = None
+    ) -> None:
+        """Set the model checkpoint via HTTP request to the local server.
+
+        Args:
+            epoch: The epoch number of the checkpoint to load.
+            checkpoint_file: Optional path to a specific checkpoint file.
+                If provided, overrides the epoch setting.
+        """
+        if self.job_id is None:
+            raise ValueError("Cannot set a checkpoint when loading from .nc.zip file")
+        return super().set_checkpoint(epoch, checkpoint_file)
+
+    def disconnect(self) -> None:
+        """Stop the local server and clean up resources."""
+        if not self.server_process:
+            if self._log_streamer is not None:
+                self._log_streamer.close()
+                self._log_streamer = None
+            return
+        try:
+            # Try graceful termination first
+            if hasattr(os, "killpg"):
+                # Unix-like systems: kill the process group
+                os.killpg(os.getpgid(self.server_process.pid), signal.SIGTERM)
+            else:
+                # Windows: terminate the process
+                self.server_process.terminate()
+
+            # Wait for graceful shutdown
+            try:
+                self.server_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # Force kill if graceful shutdown fails
+                if hasattr(os, "killpg"):
+                    os.killpg(os.getpgid(self.server_process.pid), signal.SIGKILL)
+                else:
+                    self.server_process.kill()
+                self.server_process.wait()
+
+        except (ProcessLookupError, OSError):
+            # Process already terminated
+            pass
+        finally:
+            self.server_process = None
+            if self._log_streamer is not None:
+                self._log_streamer.close()
+                self._log_streamer = None
+            logger.info("Local server stopped")
+
+
+class RemoteServerPolicy(ServerPolicy):
+    """Policy for connecting to remote endpoints on the Neuracore platform."""
+
+    def __init__(
+        self,
+        base_url: str,
+        headers: dict[str, str],
+        input_embodiment_description: EmbodimentDescription | None = None,
+    ):
+        """Initialize the remote server policy.
+
+        Args:
+            base_url: Base URL of the remote server.
+            headers: HTTP headers for authentication.
+            input_embodiment_description: Optional input spec used to project
+                local sync points before sending them to the server.
+        """
+        super().__init__(
+            base_url,
+            headers,
+            input_embodiment_description=input_embodiment_description,
+        )
+
+
+def policy(
+    input_embodiment_description: EmbodimentDescription | None = None,
+    output_embodiment_description: EmbodimentDescription | None = None,
+    input_preprocessing_config: PreprocessingConfiguration | None = None,
+    train_run_name: str | None = None,
+    model_file: str | None = None,
+    device: str | None = None,
+    robot_id: str | None = None,
+) -> DirectPolicy:
+    """Launch a direct policy that runs the model in-process.
+
+    Args:
+        input_embodiment_description: Specification of the order that will
+            be fed into the model
+        output_embodiment_description: Specification of the order that will
+            be output from the model
+        input_preprocessing_config: Preprocessing configuration for the input data.
+        train_run_name: Name of the training run to load the model from.
+        model_file: Path to the model file to load.
+        device: Torch device to run the model on (CPU or GPU, or MPS).
+        robot_id: Robot ID used to select embodiments from the model archive
+            when embodiment descriptions are not explicitly provided.
+
+    Returns:
+        DirectPolicy instance for direct model inference.
+    """
+    org_id = get_current_org()
+    job_id = None
+    if train_run_name is not None:
+        job_id = _get_job_id(train_run_name, org_id)
+        model_path = _download_model(job_id, org_id)
+    elif model_file is not None:
+        model_path = Path(model_file)
+    else:
+        raise ValueError("Must specify either train_run_name or model_file")
+
+    return DirectPolicy(
+        input_embodiment_description=input_embodiment_description,
+        output_embodiment_description=output_embodiment_description,
+        input_preprocessing_config=input_preprocessing_config,
+        org_id=org_id,
+        job_id=job_id,
+        model_path=model_path,
+        device=device,
+        robot_id=robot_id,
+    )
+
+
+def policy_local_server(
+    input_embodiment_description: EmbodimentDescription | None = None,
+    output_embodiment_description: EmbodimentDescription | None = None,
+    input_preprocessing_config: PreprocessingConfiguration | None = None,
+    train_run_name: str | None = None,
+    model_file: str | None = None,
+    device: str | None = None,
+    port: int = 8080,
+    host: str = "127.0.0.1",
+    job_id: str | None = None,
+    endpoint_id: str | None = None,
+    robot_id: str | None = None,
+) -> LocalServerPolicy:
+    """Launch a local server policy with a FastAPI server.
+
+    Args:
+        input_embodiment_description: Specification of the order that
+            will be fed into the model
+        output_embodiment_description: Specification of the order that
+            will be output from the model
+        input_preprocessing_config: Preprocessing configuration for the input data.
+        train_run_name: Name of the training run to load the model from.
+        model_file: Path to the model file to load.
+        device: Device model to be loaded on.
+        port: Port to run the server on.
+        host: Host to bind to.
+        job_id: Optional job ID to associate with the server.
+        endpoint_id: Optional endpoint ID used for endpoint log streaming.
+        robot_id: Robot ID used to select embodiments from the model archive
+            when embodiment descriptions are not explicitly provided.
+
+    Returns:
+        LocalServerPolicy instance managing a local FastAPI server.
+    """
+    if train_run_name is None and model_file is None:
+        raise ValueError("Must specify either train_run_name or model_file")
+    if train_run_name and model_file:
+        raise ValueError("Cannot specify both train_run_name and model_file")
+
+    org_id = get_current_org()
+
+    # Download model
+    if train_run_name is not None:
+        if job_id is None:
+            job_id = _get_job_id(train_run_name, org_id)
+        model_path = _download_model(job_id, org_id)
+    elif model_file is not None:
+        model_path = Path(model_file)
+    else:
+        raise ValueError("Must specify either train_run_name or model_file")
+
+    return LocalServerPolicy(
+        org_id=org_id,
+        model_path=model_path,
+        input_embodiment_description=input_embodiment_description,
+        output_embodiment_description=output_embodiment_description,
+        input_preprocessing_config=input_preprocessing_config,
+        device=device,
+        job_id=job_id,
+        port=port,
+        host=host,
+        endpoint_id=endpoint_id,
+        robot_id=robot_id,
+    )
+
+
+def policy_remote_server(
+    endpoint_name: str,
+) -> RemoteServerPolicy:
+    """Launch a remote server policy connected to a deployed endpoint.
+
+    Args:
+        endpoint_name: Name of the deployed endpoint.
+
+    Returns:
+        RemoteServerPolicy instance for remote inference.
+    """
+    auth = get_auth()
+    org_id = get_current_org()
+
+    try:
+        # Find endpoint by name
+        with Session() as session:
+            response = session.get(
+                f"{API_URL}/org/{org_id}/models/endpoints", headers=auth.get_headers()
+            )
+        response.raise_for_status()
+
+        endpoints = response.json()
+        matching_endpoints = [e for e in endpoints if e["name"] == endpoint_name]
+        if not matching_endpoints:
+            raise EndpointError(f"No endpoint found with name: {endpoint_name}")
+
+        active_endpoints = [e for e in matching_endpoints if e["status"] == "active"]
+        if not active_endpoints:
+            raise EndpointError(f"Endpoint {endpoint_name} is not active")
+        if len(active_endpoints) > 1:
+            raise EndpointError(
+                f"Multiple active endpoints found with name {endpoint_name} "
+            )
+        endpoint = active_endpoints[0]
+        input_embodiment_description = None
+        if endpoint.get("input_embodiment_description"):
+            input_embodiment_description = _parse_embodiment_description(
+                endpoint["input_embodiment_description"]
+            )
+
+        return RemoteServerPolicy(
+            base_url=f"{API_URL}/org/{org_id}/models/endpoints/{endpoint['id']}",
+            headers=auth.get_headers(),
+            input_embodiment_description=input_embodiment_description,
+        )
+    except requests.exceptions.ConnectionError:
+        raise EndpointError(
+            "Failed to connect to endpoint: Connection Error. "
+            "Please check your internet connection and try again."
+        )
+    except requests.exceptions.RequestException as e:
+        raise EndpointError(f"Failed to connect to endpoint: {str(e)}")
+
+
+# Helper functions
+def _download_model(job_id: str, org_id: str) -> Path:
+    """Download model from training run."""
+    auth = get_auth()
+    destination = Path(tempfile.gettempdir()) / job_id / "model.nc.zip"
+    if destination.exists():
+        print(f"Model already downloaded at {destination}. Skipping download.")
+        return destination
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    print("Downloading model from training run...")
+    with Session() as session:
+        response = session.get(
+            f"{API_URL}/org/{org_id}/training/jobs/{job_id}/model_url",
+            headers=auth.get_headers(),
+            timeout=30,
+        )
+    response.raise_for_status()
+
+    model_url_response = response.json()
+    model_path = download_with_progress(
+        model_url_response["url"],
+        "Downloading model...",
+        destination=destination,
+    )
+    print(f"Model download complete. Saved to {model_path}")
+    return model_path
+
+
+def _get_job_id(train_run_name: str, org_id: str) -> str:
+    """Get job ID from training run name."""
+    auth = get_auth()
+    with Session() as session:
+        response = session.get(
+            f"{API_URL}/org/{org_id}/training/jobs", headers=auth.get_headers()
+        )
+    response.raise_for_status()
+    jobs = response.json()
+
+    for job in jobs:
+        if job["name"] == train_run_name:
+            return job["id"]
+
+    raise EndpointError(f"Training run not found: {train_run_name}")
