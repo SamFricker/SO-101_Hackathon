@@ -21,6 +21,16 @@ def get_result():
     """Return the most recent classification, or None if no measurement done yet."""
     return last_result
 
+def start_measuring():
+    """Trigger a measurement from external code. Only works when baseline is done."""
+    global state, phase_start, phase_rates
+    with lock:
+        if state == "waiting":
+            state       = "measuring"
+            phase_start = time.time()
+            phase_rates = {"humidity": []}
+            print(f"Place clothing near sensor — measuring for {MEASURE_SECONDS}s...", flush=True)
+
 def classify(avg_rate, threshold):
     if avg_rate > threshold:  return "positive"
     if avg_rate < -threshold: return "negative"
@@ -33,7 +43,7 @@ def run_baseline(key, value, elapsed):
 
     if elapsed >= BASELINE_SECONDS:
         state = "waiting"
-        print(f"\nBaseline set. Press Enter to measure a clothing item.\n", flush=True)
+        print(f"\nBaseline set.\n", flush=True)
 
 def run_measurement(key, rate, elapsed):
     global state, last_result
@@ -56,7 +66,7 @@ def run_measurement(key, rate, elapsed):
             print("\nNot enough data — try again.", flush=True)
 
         state = "waiting"
-        print(f"\nRemove clothing. Press Enter for next item...\n", flush=True)
+        print(f"\nRemove clothing.\n", flush=True)
 
 def read_serial():
     global state, phase_start
@@ -125,6 +135,6 @@ def input_loop():
 input_thread = threading.Thread(target=input_loop, daemon=True)
 input_thread.start()
 
-# Keep main thread alive
-while True:
-    time.sleep(1)
+if __name__ == "__main__":
+    while True:
+        time.sleep(1)
