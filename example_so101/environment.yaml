@@ -1,0 +1,17 @@
+# SO101 teleop environment.
+# No longer requires lerobot. The STS3215 motor driver uses scservo-sdk directly.
+name: so101-teleop
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - numpy
+      - scipy
+      - opencv-python
+      - viser
+      - yourdfpy
+      - neuracore
+      - neuracore_types
+      - scservo-sdk

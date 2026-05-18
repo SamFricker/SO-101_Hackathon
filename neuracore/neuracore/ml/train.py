@@ -1,0 +1,945 @@
+"""Hydra-based training script for Neuracore models."""
+
+import copy
+import gc
+import json
+import logging
+import os
+import re
+import sys
+import time
+import traceback
+from functools import partial
+from pathlib import Path
+from typing import Any
+
+import hydra
+import torch
+import torch.multiprocessing as mp
+from names_generator import generate_name
+from neuracore_types import (
+    BatchedNCData,
+    CrossEmbodimentDescription,
+    CrossEmbodimentUnion,
+    ModelInitDescription,
+)
+from omegaconf import DictConfig, OmegaConf
+from torch.utils.data import DataLoader, DistributedSampler, random_split
+
+import neuracore as nc
+from neuracore.core.const import DEFAULT_CACHE_DIR, DEFAULT_RECORDING_CACHE_DIR
+from neuracore.core.utils.robot_data_spec_utils import (
+    extract_data_types,
+    merge_cross_embodiment_description,
+)
+from neuracore.ml import BatchedTrainingSamples, NeuracoreModel
+from neuracore.ml.datasets.pytorch_synchronized_dataset import (
+    PytorchSynchronizedDataset,
+)
+from neuracore.ml.logging.cloud_log_streamer import CloudLogStreamer
+from neuracore.ml.logging.cloud_training_logger import CloudTrainingLogger
+from neuracore.ml.logging.json_line_formatter import JsonLineLogFormatter
+from neuracore.ml.logging.tensorboard_training_logger import TensorboardTrainingLogger
+from neuracore.ml.trainers.batch_autotuner import (
+    find_optimal_batch_size,
+    is_valid_batch_size,
+)
+from neuracore.ml.trainers.distributed_trainer import (
+    DistributedTrainer,
+    cleanup_distributed,
+    setup_distributed,
+)
+from neuracore.ml.utils.algorithm_loader import AlgorithmLoader
+from neuracore.ml.utils.algorithm_storage_handler import AlgorithmStorageHandler
+from neuracore.ml.utils.device_utils import cpu_count, get_default_device
+from neuracore.ml.utils.preprocessing_utils import (
+    PreprocessingConfiguration,
+    resolve_preprocessing_config,
+)
+from neuracore.ml.utils.training_config import (
+    resolve_to_complete_config,
+    resolve_user_input_config,
+    validate_complete_config,
+)
+from neuracore.ml.utils.training_storage_handler import TrainingStorageHandler
+
+# Environment setup
+os.environ["PJRT_DEVICE"] = "GPU"
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+MAX_AUTOTUNE_SAMPLE_CANDIDATES = 1000
+
+
+def _resolve_recording_cache_dir(cfg: DictConfig) -> Path:
+    """Resolve recording cache directory for synchronized dataset downloads."""
+    configured_dir = cfg.get("recording_cache_dir")
+    if configured_dir is None:
+        return DEFAULT_RECORDING_CACHE_DIR
+    return Path(str(configured_dir)).expanduser()
+
+
+def _resolve_output_dir(
+    training_name: str | None = None,
+    training_name_auto_increment: bool | str = False,
+) -> str:
+    """Hydra resolver to generate the output directory path.
+
+    This resolver generates a unique output directory based on training_name.
+    It's called during Hydra initialization, so the directory is available before
+    the main function runs.
+
+    When training_name_auto_increment is False (default), if a directory for the given
+    run name already exists, resolution fails with FileExistsError. Set
+    training_name_auto_increment=true to automatically use name_1, name_2, etc.
+
+    Args:
+        training_name: Optional training name. If None or "null", a random name
+            will be generated.
+        training_name_auto_increment: If True (or "true"), append _1, _2, ...
+            when the name already exists. If False (default), fail when the name
+            exists.
+
+    Returns:
+        Full path to the output directory.
+
+    Raises:
+        FileExistsError: When training_name_auto_increment is False and a
+            directory for training_name (or training_name_N) already exists.
+    """
+    # Handle None, empty string, or string "null"
+    if (
+        not training_name
+        or training_name == "null"
+        or (isinstance(training_name, str) and training_name.strip() == "")
+    ):
+        # Generate name with hyphens instead of underscores
+        training_name = generate_name(style="underscore").replace("_", "-")
+    else:
+        training_name = _sanitize_run_name(str(training_name))
+
+    auto_increment = (
+        str(training_name_auto_increment).lower() == "true"
+        if not isinstance(training_name_auto_increment, bool)
+        else training_name_auto_increment
+    )
+
+    base_dir = DEFAULT_CACHE_DIR / "runs"
+
+    final_training_name = training_name
+    if base_dir.exists():
+        taken = {
+            p.name
+            for p in base_dir.iterdir()
+            if p.is_dir()
+            and (p.name == training_name or p.name.startswith(f"{training_name}_"))
+        }
+        if training_name in taken:
+            if not auto_increment:
+                existing = base_dir / training_name
+                raise FileExistsError(
+                    f"A training named {training_name!r} already exists at "
+                    f"{existing}. Either use a different training_name, or set "
+                    "training_name_auto_increment=true to use an incremented "
+                    "name (e.g. training_name_1)."
+                )
+            suffix = 1
+            while f"{training_name}_{suffix}" in taken:
+                suffix += 1
+            final_training_name = f"{training_name}_{suffix}"
+            logger.warning(
+                f"A training named {training_name} already exists. "
+                f"Using {final_training_name} for this run."
+            )
+
+    # Build full path
+    return str(base_dir / final_training_name)
+
+
+def _sanitize_run_name(name: str) -> str:
+    """Sanitize run name for use in file paths.
+
+    Args:
+        name: The run name to sanitize.
+
+    Returns:
+        A sanitized version of the name safe for file paths.
+    """
+    # Replace spaces, slashes, and other problematic characters with underscores
+    sanitized = re.sub(r"[^\w\-]", "_", name)
+    # Remove multiple consecutive underscores
+    sanitized = re.sub(r"_+", "_", sanitized)
+    # Remove leading/trailing underscores
+    sanitized = sanitized.strip("_")
+    return sanitized
+
+
+def _estimate_sample_tensor_bytes(sample: BatchedTrainingSamples) -> int:
+    """Roughly estimate total tensor memory footprint (bytes) for a sample."""
+
+    def _collect(obj: Any) -> int:
+        if torch.is_tensor(obj):
+            return obj.numel() * obj.element_size()
+        if isinstance(obj, BatchedNCData):
+            return _collect(obj.model_dump())
+        if isinstance(obj, dict):
+            return sum(_collect(v) for v in obj.values())
+        if isinstance(obj, (list, tuple)):
+            return sum(_collect(v) for v in obj)
+        return 0
+
+    return _collect({
+        "inputs": sample.inputs,
+        "inputs_mask": sample.inputs_mask,
+        "outputs": sample.outputs,
+        "outputs_mask": sample.outputs_mask,
+    })
+
+
+def _serialize_robot_data_spec(
+    cross_embodiment_description: CrossEmbodimentDescription,
+) -> dict[str, dict[str, list[str]]]:
+    """Convert indexed robot data specs to JSON-serializable ordered name lists."""
+    serializable: dict[str, dict[str, list[str]]] = {}
+    for robot_id, data_types in cross_embodiment_description.items():
+        serializable[robot_id] = {}
+        for data_type, indexed_names in data_types.items():
+            key = data_type.name if hasattr(data_type, "name") else str(data_type)
+            serializable[robot_id][key] = [
+                indexed_names[index] for index in sorted(indexed_names)
+            ]
+    return serializable
+
+
+def _serialize_cross_embodiment_union(
+    cross_embodiment_union: CrossEmbodimentUnion,
+) -> dict[str, dict[str, list[str]]]:
+    """Convert merged robot data specs to JSON-serializable form."""
+    serializable: dict[str, dict[str, list[str]]] = {}
+    for robot_id, data_types in cross_embodiment_union.items():
+        serializable[robot_id] = {}
+        for data_type, names in data_types.items():
+            key = data_type.name if hasattr(data_type, "name") else str(data_type)
+            serializable[robot_id][key] = list(names)
+    return serializable
+
+
+def _save_local_training_metadata(
+    cfg: DictConfig,
+    algorithm_name: str,
+    input_cross_embodiment_description: CrossEmbodimentDescription,
+    output_cross_embodiment_description: CrossEmbodimentDescription,
+    cross_embodiment_union: CrossEmbodimentUnion,
+) -> None:
+    """Persist basic training run metadata locally for local runs."""
+    training_id = getattr(cfg, "training_id", None)
+    if training_id is not None:
+        # Cloud run metadata is stored remotely; skip local save.
+        return
+
+    output_dir = Path(getattr(cfg, "local_output_dir", "."))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_id = output_dir.name
+
+    metadata = {
+        "id": run_id,
+        "name": run_id,
+        "status": "RUNNING",
+        "algorithm": algorithm_name,
+        "algorithm_id": getattr(cfg, "algorithm_id", None),
+        "dataset_id": getattr(cfg, "dataset_id", None),
+        "dataset_name": getattr(cfg, "dataset_name", None),
+        "launch_time": time.time(),
+        "local_output_dir": str(output_dir),
+        "org_id": getattr(cfg, "org_id", None),
+        "input_cross_embodiment_description": _serialize_robot_data_spec(
+            input_cross_embodiment_description
+        ),
+        "output_cross_embodiment_description": _serialize_robot_data_spec(
+            output_cross_embodiment_description
+        ),
+        "frequency": getattr(cfg, "frequency", None),
+        "output_prediction_horizon": getattr(cfg, "output_prediction_horizon", None),
+        # Align with cloud run schema for inspect output
+        "epoch": -1,
+        "step": -1,
+        "gpu_type": None,
+        "num_gpus": None,
+        "synchronization_details": {
+            "frequency": getattr(cfg, "frequency", None),
+            "allow_duplicates": getattr(cfg, "allow_duplicates", True),
+            "max_delay_s": (
+                sys.float_info.max
+                if getattr(cfg, "max_delay_s", None) is None
+                else getattr(cfg, "max_delay_s")
+            ),
+            "trim_start_end": getattr(cfg, "trim_start_end", True),
+            "cross_embodiment_union": _serialize_cross_embodiment_union(
+                cross_embodiment_union
+            ),
+        },
+    }
+
+    metadata_path = output_dir / "training_run.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2))
+
+
+def setup_logging(output_dir: str, rank: int = 0) -> None:
+    """Setup logging configuration."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    stream_handler = logging.StreamHandler()
+
+    if rank == 0:
+        file_handler = logging.FileHandler(output_path / "train.log")
+    else:
+        file_handler = logging.FileHandler(output_path / f"train-rank{rank}.log")
+    file_handler.setFormatter(JsonLineLogFormatter())
+
+    handlers: list[logging.Handler] = [file_handler, stream_handler]
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=handlers,
+        force=True,
+    )
+
+
+def get_model_and_algorithm_config(
+    cfg: DictConfig,
+    model_init_description: ModelInitDescription,
+) -> tuple[NeuracoreModel, dict[str, Any]]:
+    """Get model and algorithm configuration."""
+    algorithm_config: dict[str, Any] = {}
+    if "algorithm" in cfg:
+        algorithm_config = OmegaConf.to_container(cfg.algorithm, resolve=True)
+        algorithm_config.pop("_target_", None)
+        logger.info("Using custom algorithm parameters")
+        logger.info(f"Algorithm parameters: {algorithm_config}")
+
+        model = hydra.utils.instantiate(
+            cfg.algorithm,
+            model_init_description=model_init_description,
+            **algorithm_config,
+        )
+    elif cfg.algorithm_id is not None:
+        # Use algorithm_params for custom parameters
+        if cfg.algorithm_params is not None:
+            algorithm_config = OmegaConf.to_container(
+                cfg.algorithm_params, resolve=True
+            )
+            logger.info("Using custom algorithm parameters")
+            logger.info(f"Algorithm parameters: {algorithm_config}")
+
+        extract_dir = Path(cfg.local_output_dir) / "algorithm"
+        algorithm_loader = AlgorithmLoader(extract_dir)
+        model_class = algorithm_loader.load_model()
+        model = model_class(
+            model_init_description=model_init_description,
+            **algorithm_config,
+        )
+    else:
+        raise ValueError(
+            "Either 'algorithm' or 'algorithm_id' "
+            "must be provided in the configuration"
+        )
+    return model, algorithm_config
+
+
+def _create_model_for_batch_validation(
+    cfg: DictConfig, model_init_description: ModelInitDescription
+) -> NeuracoreModel:
+    """Create a model instance for batch size validation (called inside subprocess)."""
+    model, _ = get_model_and_algorithm_config(cfg, model_init_description)
+    return model
+
+
+def assert_valid_batch_size(
+    batch_size: int,
+    cfg: DictConfig,
+    dataset: PytorchSynchronizedDataset,
+    input_cross_embodiment_description: CrossEmbodimentDescription,
+    output_cross_embodiment_description: CrossEmbodimentDescription,
+    device: torch.device | None = None,
+) -> None:
+    """Assert that a user-selected batch size fits in GPU memory.
+
+    The check is skipped on CPU (or when CUDA is unavailable). The user-selected
+    batch size is trusted in that case.
+
+    Raises:
+        ValueError: If ``batch_size`` does not fit in GPU memory.
+    """
+    if not torch.cuda.is_available() or (
+        device is not None and "cuda" not in device.type
+    ):
+        logger.warning("Skipping batch size memory check: GPU not available.")
+        return
+
+    if device is None:
+        device = get_default_device()
+
+    logger.info(f"Validating batch size {batch_size} on {device}...")
+
+    # Avoid altering the original dataset
+    assert_dataset = copy.deepcopy(dataset)
+
+    dataset_statistics_by_role = assert_dataset.dataset_statistics
+    model_init_description = ModelInitDescription(
+        input_dataset_statistics=dataset_statistics_by_role["input"],
+        output_dataset_statistics=dataset_statistics_by_role["output"],
+        input_data_types=extract_data_types(input_cross_embodiment_description),
+        output_data_types=extract_data_types(output_cross_embodiment_description),
+        output_prediction_horizon=cfg.output_prediction_horizon,
+    )
+    model_factory = partial(
+        _create_model_for_batch_validation, cfg, model_init_description
+    )
+
+    try:
+        valid = is_valid_batch_size(
+            cfg=cfg,
+            model_factory=model_factory,
+            dataset=assert_dataset,
+            batch_size=batch_size,
+            device=device,
+        )
+    except Exception:
+        logger.error("Batch size validation failed", exc_info=True)
+        raise
+    finally:
+        del assert_dataset
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    if not valid:
+        raise ValueError(
+            f"Batch size {batch_size} is not valid: it does not fit in "
+            "memory for the current algorithm, dataset, and GPU type. "
+            "Try a smaller batch size, or use batch_size='auto' to automatically "
+            "find the largest batch size that fits."
+        )
+
+    logger.info(f"Batch size {batch_size} is valid.")
+
+
+def determine_optimal_batch_size(
+    cfg: DictConfig,
+    dataset: PytorchSynchronizedDataset,
+    input_cross_embodiment_description: CrossEmbodimentDescription,
+    output_cross_embodiment_description: CrossEmbodimentDescription,
+    device: torch.device | None = None,
+) -> int:
+    """Run batch size autotuning on a single GPU and return the result."""
+    if not torch.cuda.is_available() or (
+        device is not None and "cuda" not in device.type
+    ):
+        raise ValueError("Autotuning is only supported on GPUs.")
+
+    if device is None:
+        device = get_default_device()
+
+    logger.info(f"Starting batch size autotuning on {device}...")
+
+    # Avoid altering the original dataset
+    autotuning_dataset = copy.deepcopy(dataset)
+
+    dataset_statistics_by_role = autotuning_dataset.dataset_statistics
+    model_init_description = ModelInitDescription(
+        input_dataset_statistics=dataset_statistics_by_role["input"],
+        output_dataset_statistics=dataset_statistics_by_role["output"],
+        input_data_types=extract_data_types(input_cross_embodiment_description),
+        output_data_types=extract_data_types(output_cross_embodiment_description),
+        output_prediction_horizon=cfg.output_prediction_horizon,
+    )
+    model_factory = partial(
+        _create_model_for_batch_validation, cfg, model_init_description
+    )
+
+    try:
+        optimal_batch_size = find_optimal_batch_size(
+            cfg=cfg,
+            model_factory=model_factory,
+            dataset=autotuning_dataset,
+            device=device,
+        )
+    except Exception:
+        logger.error("Batch size autotuning failed", exc_info=True)
+        raise
+    finally:
+        # Clean up
+        del autotuning_dataset
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    logger.info(
+        f"Autotuning complete. Optimal batch size per GPU: {optimal_batch_size}"
+    )
+
+    return optimal_batch_size
+
+
+def run_training(
+    rank: int,
+    world_size: int,
+    cfg: DictConfig,
+    batch_size: int,
+    input_cross_embodiment_description: CrossEmbodimentDescription,
+    output_cross_embodiment_description: CrossEmbodimentDescription,
+    input_preprocessing_config: PreprocessingConfiguration,
+    output_preprocessing_config: PreprocessingConfiguration,
+    dataset: PytorchSynchronizedDataset,
+    device: torch.device | None = None,
+) -> None:
+    """Run the training process for a single GPU."""
+    # Setup for distributed training
+    if world_size > 1:
+        nc.login()  # Ensure Neuracore is logged in on this process
+        setup_distributed(rank, world_size)
+
+    # Setup logging (different file per process)
+    setup_logging(cfg.local_output_dir, rank)
+    logger = logging.getLogger(__name__)
+
+    # Set random seed (different for each process to ensure different data sampling)
+    torch.manual_seed(cfg.seed + rank)
+
+    try:
+        logger.info(f"Using batch size: {batch_size}")
+
+        # Merge data_types for synchronization
+        merge_cross_embodiment_description(
+            input_cross_embodiment_description, output_cross_embodiment_description
+        )
+
+        # Split dataset
+        dataset_size = len(dataset)
+        train_split = 1 - cfg.validation_split
+        train_size = int(train_split * dataset_size)
+        val_size = dataset_size - train_size
+
+        # Use random split with fixed seed for deterministic behavior
+        generator = torch.Generator().manual_seed(cfg.seed)
+        train_dataset, val_dataset = random_split(
+            dataset, [train_size, val_size], generator=generator
+        )
+
+        num_train_workers = min(cfg.num_train_workers, cpu_count())
+        num_val_workers = min(cfg.num_val_workers, cpu_count())
+
+        if world_size > 1:
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                seed=cfg.seed,
+            )
+            val_sampler = DistributedSampler(
+                val_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False,
+                seed=cfg.seed,
+            )
+
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                sampler=train_sampler,
+                num_workers=num_train_workers,
+                pin_memory=True,
+                persistent_workers=num_train_workers > 0,
+                collate_fn=dataset.collate_fn,
+            )
+
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                sampler=val_sampler,
+                num_workers=num_val_workers,
+                pin_memory=True,
+                persistent_workers=num_val_workers > 0,
+                collate_fn=dataset.collate_fn,
+            )
+        else:
+            # Regular data loaders for single GPU training
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=num_train_workers,
+                pin_memory=True,
+                persistent_workers=num_train_workers > 0,
+                collate_fn=dataset.collate_fn,
+            )
+
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_val_workers,
+                pin_memory=True,
+                persistent_workers=num_val_workers > 0,
+                collate_fn=dataset.collate_fn,
+            )
+
+        # Log data loader information
+        logger.info(
+            f"Created data loaders with {len(train_loader.dataset)} training samples "
+            f"and {len(val_loader.dataset)} validation samples"
+        )
+
+        # Model doesn't need to know about ids or names, just data types
+        input_data_types = extract_data_types(input_cross_embodiment_description)
+        output_data_types = extract_data_types(output_cross_embodiment_description)
+        dataset_statistics_by_role = dataset.dataset_statistics
+        model_init_description = ModelInitDescription(
+            input_dataset_statistics=dataset_statistics_by_role["input"],
+            output_dataset_statistics=dataset_statistics_by_role["output"],
+            input_data_types=input_data_types,
+            output_data_types=output_data_types,
+            output_prediction_horizon=cfg.output_prediction_horizon,
+        )
+
+        model, algorithm_config = get_model_and_algorithm_config(
+            cfg, model_init_description
+        )
+
+        training_id = getattr(cfg, "training_id", None)
+        training_storage_handler = TrainingStorageHandler(
+            local_dir=cfg.local_output_dir,
+            training_job_id=training_id,
+            algorithm_config=algorithm_config,
+            input_cross_embodiment_description=input_cross_embodiment_description,
+            output_cross_embodiment_description=output_cross_embodiment_description,
+            input_preprocessing_config=input_preprocessing_config,
+            output_preprocessing_config=output_preprocessing_config,
+        )
+
+        logger.info(
+            f"Created model with "
+            f"{sum(p.numel() for p in model.parameters()):,} parameters"
+        )
+
+        training_logger: TensorboardTrainingLogger | CloudTrainingLogger
+        if training_id is None:
+            training_logger = TensorboardTrainingLogger(
+                log_dir=Path(cfg.local_output_dir) / "tensorboard",
+            )
+        else:
+            training_logger = CloudTrainingLogger(
+                training_id=training_id,
+            )
+
+        trainer = DistributedTrainer(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            training_logger=training_logger,
+            storage_handler=training_storage_handler,
+            output_dir=Path(cfg.local_output_dir),
+            num_epochs=cfg.epochs,
+            log_freq=cfg.logging_frequency,
+            keep_last_n_checkpoints=cfg.keep_last_n_checkpoints,
+            clip_grad_norm=algorithm_config.get("clip_grad_norm", None),
+            rank=rank,
+            world_size=world_size,
+            device=device,
+        )
+
+        # Resume from checkpoint if specified
+        start_epoch = 0
+        if cfg.resume_checkpoint_path is not None:
+            try:
+                checkpoint = trainer.load_checkpoint(cfg.resume_checkpoint_path)
+                start_epoch = checkpoint.get("epoch", 0) + 1
+                logger.info(f"Resumed from checkpoint at epoch {start_epoch}")
+            except Exception:
+                logger.error("Failed to load checkpoint.", exc_info=True)
+
+        # Start training
+        try:
+            logger.info("Starting training...")
+            trainer.train(start_epoch=start_epoch)
+            logger.info("Training completed successfully!")
+        except Exception:
+            logger.error("Training failed.", exc_info=True)
+            raise
+
+    finally:
+        # Clean up distributed process group
+        if world_size > 1:
+            cleanup_distributed()
+
+        logger.info(f"Process {rank} completed")
+
+
+# Register the resolver with OmegaConf
+OmegaConf.register_new_resolver(
+    "resolve_output_dir",
+    _resolve_output_dir,
+    use_cache=True,  # Avoid re-resolving the output directory after it's been created
+)
+
+
+def _try_report_error_to_cloud(cfg: DictConfig, error_msg: str) -> None:
+    """Best-effort attempt to report a training error to the cloud.
+
+    This function is deliberately exception-safe: it will never raise, so it
+    cannot mask the original error that triggered the call.
+
+    Args:
+        cfg: Hydra configuration (may be only partially resolved).
+        error_msg: Formatted traceback / error message to persist.
+    """
+    try:
+        nc.login()
+        org_id = getattr(cfg, "org_id", None)
+        if org_id is not None:
+            nc.set_organization(org_id)
+        local_output_dir = getattr(cfg, "local_output_dir", None)
+        training_id = getattr(cfg, "training_id", None)
+        storage_handler = TrainingStorageHandler(
+            local_dir=str(local_output_dir) if local_output_dir else "./output",
+            training_job_id=training_id,
+        )
+        storage_handler.report_training_error(error_msg)
+        logger.info("Successfully reported training error to cloud.")
+    except Exception:
+        logger.error("Failed to report training error to cloud.", exc_info=True)
+
+
+def _main(cfg: DictConfig) -> None:
+    """Inner implementation of main.
+
+    Separated so the outer wrapper can catch
+    any exception and report it to the cloud before re-raising.
+
+    Args:
+        cfg: Fully resolved Hydra configuration.
+    """
+    # Merge Config with the base config from the algorithm
+    cfg = resolve_user_input_config(cfg)
+
+    setup_logging(cfg.local_output_dir)
+    log_streamer: CloudLogStreamer | None = None
+
+    try:
+        # Checks all parameters are valid inputs
+        validate_complete_config(cfg)
+
+        # Login before constructing cloud storage so org/auth state is available.
+        nc.login()
+        if cfg.org_id is not None:
+            nc.set_organization(cfg.org_id)
+
+        training_id = cfg.get("training_id")
+        # If a training ID is provided,
+        # We assume it is a Cloud Training Run
+        if training_id is not None:
+            setup_storage_handler = TrainingStorageHandler(
+                local_dir=cfg.local_output_dir,
+                training_job_id=training_id,
+            )
+            log_streamer = CloudLogStreamer(
+                storage_handler=setup_storage_handler,
+                output_dir=Path(cfg.local_output_dir),
+            )
+            log_streamer.start()
+
+        if cfg.dataset_name is not None:
+            dataset = nc.get_dataset(name=cfg.dataset_name)
+        else:
+            dataset = nc.get_dataset(id=cfg.dataset_id)
+
+        cfg = resolve_to_complete_config(cfg, dataset=dataset)
+        logger.info("Training configuration:")
+        logger.info(OmegaConf.to_yaml(cfg, resolve=False))
+        logger.info(f"Training run directory: {cfg.local_output_dir}")
+
+        dataset.cache_dir = _resolve_recording_cache_dir(cfg)
+        dataset.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        input_cross_embodiment_description = cfg.input_cross_embodiment_description
+        output_cross_embodiment_description = cfg.output_cross_embodiment_description
+        # =========================================================
+        # From here onwards we only deal with robot IDs, not names
+        # =========================================================
+        batch_size = cfg.batch_size
+
+        # Validate that the provided parameters are consistent and sufficient
+
+        # Prepare data types for synchronization
+        cross_embodiment_union: CrossEmbodimentUnion = (
+            merge_cross_embodiment_description(
+                input_cross_embodiment_description, output_cross_embodiment_description
+            )
+        )
+
+        # Save local metadata so CLI can inspect local runs without cloud access
+        _save_local_training_metadata(
+            cfg,
+            algorithm_name=cfg.algorithm_name,
+            input_cross_embodiment_description=input_cross_embodiment_description,
+            output_cross_embodiment_description=output_cross_embodiment_description,
+            cross_embodiment_union=cross_embodiment_union,
+        )
+
+        synchronized_dataset = dataset.synchronize(
+            frequency=cfg.frequency,
+            cross_embodiment_union=cross_embodiment_union,
+            prefetch_videos=True,
+            max_prefetch_workers=cfg.max_prefetch_workers,
+            max_delay_s=(
+                sys.float_info.max
+                if getattr(cfg, "max_delay_s", None) is None
+                else cfg.max_delay_s
+            ),
+            allow_duplicates=cfg.allow_duplicates,
+            trim_start_end=cfg.trim_start_end,
+        )
+
+        # Check if distributed training is enabled and multiple GPUs are available
+        world_size = torch.cuda.device_count()
+
+        if cfg.algorithm_id is not None:
+            # Download the algorithm so that it can be processed later
+            logger.info(f"Downloading algorithm from cloud with ID: {cfg.algorithm_id}")
+            storage_handler = AlgorithmStorageHandler(algorithm_id=cfg.algorithm_id)
+            extract_dir = Path(cfg.local_output_dir) / "algorithm"
+            storage_handler.download_algorithm(extract_dir=extract_dir)
+            logger.info(f"Algorithm extracted to {extract_dir}")
+
+        device = None
+        if cfg.device is not None:
+            device = torch.device(cfg.device)
+        else:
+            device = get_default_device()
+
+        preprocessing_dictconfig = cfg.get("preprocessing", {})
+        if not preprocessing_dictconfig:
+            raise ValueError(
+                "Preprocessing configuration is missing ! Please provide a "
+                "preprocessing configuration."
+            )
+        input_preprocessing_config_cfg = preprocessing_dictconfig.get(
+            "input", OmegaConf.create({})
+        )
+        if not input_preprocessing_config_cfg:
+            raise ValueError(
+                "Input preprocessing configuration is missing ! Please provide an "
+                "input preprocessing configuration."
+            )
+        output_preprocessing_config_cfg = preprocessing_dictconfig.get(
+            "output", OmegaConf.create({})
+        )
+        if not output_preprocessing_config_cfg:
+            raise ValueError(
+                "Output preprocessing configuration is missing ! Please provide an "
+                "output preprocessing configuration."
+            )
+
+        input_preprocessing_config = resolve_preprocessing_config(
+            input_preprocessing_config_cfg
+        )
+
+        output_preprocessing_config = resolve_preprocessing_config(
+            output_preprocessing_config_cfg
+        )
+
+        # Create a pytorch synchronized dataset
+        # NOTE: we are creating it here, and not in training to access the first sample
+        # for batch size autotuning, if used.
+        pytorch_dataset = PytorchSynchronizedDataset(
+            synchronized_dataset=synchronized_dataset,
+            input_cross_embodiment_description=input_cross_embodiment_description,
+            output_cross_embodiment_description=output_cross_embodiment_description,
+            output_prediction_horizon=cfg.output_prediction_horizon,
+            input_preprocessing_config=input_preprocessing_config,
+            output_preprocessing_config=output_preprocessing_config,
+        )
+
+        # Handle batch size configuration
+        if isinstance(batch_size, str) and batch_size.lower() == "auto":
+            # Find the largest batch size that fits in RAM and GPU memory
+            optimal_batch_size = determine_optimal_batch_size(
+                cfg=cfg,
+                dataset=pytorch_dataset,
+                input_cross_embodiment_description=input_cross_embodiment_description,
+                output_cross_embodiment_description=output_cross_embodiment_description,
+                device=device,
+            )
+
+            batch_size = optimal_batch_size
+        else:
+            # Check if the specified batch size fits in RAM and GPU memory
+            assert_valid_batch_size(
+                batch_size=int(batch_size),
+                cfg=cfg,
+                dataset=pytorch_dataset,
+                input_cross_embodiment_description=input_cross_embodiment_description,
+                output_cross_embodiment_description=output_cross_embodiment_description,
+                device=device,
+            )
+
+            batch_size = int(batch_size)
+
+        if world_size > 1:
+            # Use multiprocessing to launch multiple processes
+            mp.spawn(
+                run_training,
+                args=(
+                    world_size,
+                    cfg,
+                    batch_size,
+                    input_cross_embodiment_description,
+                    output_cross_embodiment_description,
+                    input_preprocessing_config,
+                    output_preprocessing_config,
+                    pytorch_dataset,
+                    device,
+                ),
+                nprocs=world_size,
+                join=True,
+            )
+        else:
+            # Single GPU or CPU training
+            run_training(
+                0,
+                1,
+                cfg,
+                batch_size,
+                input_cross_embodiment_description,
+                output_cross_embodiment_description,
+                input_preprocessing_config,
+                output_preprocessing_config,
+                pytorch_dataset,
+                device,
+            )
+    finally:
+        if log_streamer is not None:
+            log_streamer.close()
+
+
+@hydra.main(version_base=None, config_path="config", config_name="config")
+def main(cfg: DictConfig) -> None:
+    """Main function to run the training script."""
+    # Read training_id early — before any code that might raise — so it is
+    # available for error reporting even if cfg resolution fails later.
+    training_id = getattr(cfg, "training_id", None)
+
+    try:
+        _main(cfg)
+    except Exception:
+        error_msg = traceback.format_exc()
+        logger.error("Training script failed:\n%s", error_msg)
+        if training_id is not None:
+            _try_report_error_to_cloud(cfg, error_msg)
+        raise
+
+
+if __name__ == "__main__":
+    main()

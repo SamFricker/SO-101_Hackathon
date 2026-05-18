@@ -1,0 +1,455 @@
+"""Model archive creation utility for Neuracore model deployment.
+
+This module provides functionality to package Neuracore models into simple
+ZIP archives (.nc.zip) for deployment. It handles model serialization,
+dependency management, and packaging of all required files for inference.
+"""
+
+import inspect
+import json
+import logging
+import tempfile
+import zipfile
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+
+import torch
+from neuracore_types import CrossEmbodimentDescription, ModelInitDescription
+from omegaconf import OmegaConf
+
+from neuracore.ml.core.neuracore_model import NeuracoreModel
+from neuracore.ml.utils.algorithm_loader import AlgorithmLoader
+from neuracore.ml.utils.device_utils import get_default_device
+from neuracore.ml.utils.json_serialization import to_json_serializable
+from neuracore.ml.utils.preprocessing_utils import (
+    PreprocessingConfiguration,
+    resolve_preprocessing_config,
+)
+
+logger = logging.getLogger(__name__)
+
+ArchiveEntry = Path | list[Path]
+
+
+def _archive_path(extracted_files: dict[str, ArchiveEntry], key: str) -> Path:
+    """Return a single extracted file path by key."""
+    value = extracted_files[key]
+    if isinstance(value, list):
+        raise ValueError(f"Archive entry {key!r} contains multiple files.")
+    return value
+
+
+def _build_archive_metadata() -> dict[str, str | None]:
+    """Build archive metadata with installed package versions."""
+    try:
+        nc_types_version = version("neuracore-types")
+    except PackageNotFoundError:
+        logger.warning(
+            "Could not determine installed version for package 'neuracore-types'."
+        )
+        nc_types_version = None
+
+    try:
+        nc_version = version("neuracore")
+    except PackageNotFoundError:
+        logger.warning("Could not determine installed version for package 'neuracore'.")
+        nc_version = None
+
+    return {
+        "neuracore_version": nc_version,
+        "neuracore_types_version": nc_types_version,
+    }
+
+
+def create_nc_archive(
+    model: NeuracoreModel,
+    output_dir: Path,
+    algorithm_config: object | None = None,
+    input_cross_embodiment_description: object | None = None,
+    output_cross_embodiment_description: object | None = None,
+    input_preprocessing_config: PreprocessingConfiguration | None = None,
+    output_preprocessing_config: PreprocessingConfiguration | None = None,
+) -> Path:
+    """Create a Neuracore model archive (NC.ZIP) file from a Neuracore model.
+
+    Packages a trained Neuracore model into a deployable ZIP file that includes
+    the model weights, algorithm code, configuration metadata, and dependencies.
+    The resulting NC.ZIP file can be deployed for inference.
+
+    Args:
+        model: Trained Neuracore model instance to package for deployment.
+        output_dir: Directory path where the NC.ZIP file will be created.
+        algorithm_config: Custom configuration for the algorithm.
+        input_cross_embodiment_description: Input embodiment mapping.
+        output_cross_embodiment_description: Output embodiment mapping.
+        input_preprocessing_config: preprocessing configuration for the input data.
+        output_preprocessing_config: preprocessing configuration for the output data.
+
+    Returns:
+        Path to the created NC.ZIP file.
+    """
+    algorithm_file = Path(inspect.getfile(model.__class__))
+    algorithm_loader = AlgorithmLoader(algorithm_file.parent)
+    algo_files = algorithm_loader.get_all_files()
+    requirements_file_path = algorithm_loader.algorithm_dir / "requirements.txt"
+
+    # Create output directory if it doesn't exist
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create the archive filename
+    archive_path = output_dir / "model.nc.zip"
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+
+        # Save model weights
+        torch.save(model.state_dict(), temp_path / "model.pt")
+        model_size_mb = (temp_path / "model.pt").stat().st_size / (1024 * 1024)
+        logger.info("Model weights saved (%.1f MB)", model_size_mb)
+
+        # Save model initialization description
+        with open(temp_path / "model_init_description.json", "w") as f:
+            json.dump(to_json_serializable(model.model_init_description), f, indent=2)
+
+        # Save algorithm config (always create file, even if empty)
+        with open(temp_path / "algorithm_config.json", "w") as f:
+            json.dump(to_json_serializable(algorithm_config or {}), f, indent=2)
+
+        # Save cross-embodiment descriptions
+        with open(temp_path / "input_cross_embodiment_description.json", "w") as f:
+            json.dump(
+                to_json_serializable(input_cross_embodiment_description or {}),
+                f,
+                indent=2,
+            )
+        with open(temp_path / "output_cross_embodiment_description.json", "w") as f:
+            json.dump(
+                to_json_serializable(output_cross_embodiment_description or {}),
+                f,
+                indent=2,
+            )
+        with open(temp_path / "input_preprocessing_config.json", "w") as f:
+            json.dump(
+                {
+                    data_type.value: [m.to_dict() for m in methods]
+                    for data_type, methods in (input_preprocessing_config or {}).items()
+                },
+                f,
+                indent=2,
+            )
+        with open(temp_path / "output_preprocessing_config.json", "w") as f:
+            json.dump(
+                {
+                    data_type.value: [m.to_dict() for m in methods]
+                    for data_type, methods in (
+                        output_preprocessing_config or {}
+                    ).items()
+                },
+                f,
+                indent=2,
+            )
+
+        # Save archive metadata
+        with open(temp_path / "metadata", "w") as f:
+            json.dump(_build_archive_metadata(), f, indent=2)
+
+        # Create the ZIP archive
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            zip_file.write(
+                temp_path / "model.pt", "model.pt", compress_type=zipfile.ZIP_STORED
+            )
+
+            # Add model initialization description
+            zip_file.write(
+                temp_path / "model_init_description.json", "model_init_description.json"
+            )
+
+            # Add algorithm config (always present)
+            zip_file.write(temp_path / "algorithm_config.json", "algorithm_config.json")
+
+            # Add cross-embodiment descriptions
+            zip_file.write(
+                temp_path / "input_cross_embodiment_description.json",
+                "input_cross_embodiment_description.json",
+            )
+            zip_file.write(
+                temp_path / "output_cross_embodiment_description.json",
+                "output_cross_embodiment_description.json",
+            )
+            zip_file.write(
+                temp_path / "input_preprocessing_config.json",
+                "input_preprocessing_config.json",
+            )
+            zip_file.write(
+                temp_path / "output_preprocessing_config.json",
+                "output_preprocessing_config.json",
+            )
+
+            # Add archive metadata
+            zip_file.write(temp_path / "metadata", "metadata")
+
+            # Add all algorithm files
+            for algo_file in algo_files:
+                # Calculate relative path from algorithm directory
+                rel_path = algo_file.relative_to(algorithm_loader.algorithm_dir)
+                zip_file.write(algo_file, f"algorithm/{rel_path}")
+
+            # Add requirements file if it exists
+            if requirements_file_path.exists():
+                zip_file.write(requirements_file_path, "algorithm/requirements.txt")
+
+    archive_size_mb = archive_path.stat().st_size / (1024 * 1024)
+    logger.info(
+        "NC archive created successfully: %s (%.1f MB)", archive_path, archive_size_mb
+    )
+    return archive_path
+
+
+def extract_nc_archive(archive_file: Path, output_dir: Path) -> dict[str, ArchiveEntry]:
+    """Extract all contents from a Neuracore model archive (NC.ZIP) file.
+
+    Extracts all files from a NC.ZIP archive including model weights, algorithm code,
+    configuration files, and dependencies.
+
+    Args:
+        archive_file: Path to the NC.ZIP file to extract.
+        output_dir: Directory where extracted files will be saved.
+
+    Returns:
+        Dictionary mapping file types to their extracted paths.
+
+    Raises:
+        FileNotFoundError: If the archive file doesn't exist.
+        zipfile.BadZipFile: If the archive file is corrupted or not a valid ZIP.
+    """
+    if not archive_file.exists():
+        raise FileNotFoundError(f"Archive file not found: {archive_file}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    extracted_files: dict[str, ArchiveEntry] = {}
+
+    with zipfile.ZipFile(archive_file, "r") as zip_ref:
+        # Extract all files
+        zip_ref.extractall(output_dir)
+
+        # Catalog the extracted files
+        for file_info in zip_ref.filelist:
+            file_path = output_dir / file_info.filename
+
+            # Categorize files based on their names/extensions
+            if file_info.filename == "model.pt":
+                extracted_files["model_weights"] = file_path
+            elif file_info.filename == "model_init_description.json":
+                extracted_files["model_init_description"] = file_path
+            elif file_info.filename == "algorithm_config.json":
+                extracted_files["algorithm_config"] = file_path
+            elif file_info.filename == "input_cross_embodiment_description.json":
+                extracted_files["input_cross_embodiment_description"] = file_path
+            elif file_info.filename == "output_cross_embodiment_description.json":
+                extracted_files["output_cross_embodiment_description"] = file_path
+            elif file_info.filename == "input_preprocessing_config.json":
+                extracted_files["input_preprocessing_config"] = file_path
+            elif file_info.filename == "output_preprocessing_config.json":
+                extracted_files["output_preprocessing_config"] = file_path
+            elif file_info.filename == "metadata":
+                extracted_files["metadata"] = file_path
+            elif file_info.filename == "algorithm/requirements.txt":
+                extracted_files["algorithm_requirements"] = file_path
+            elif file_info.filename.startswith("algorithm/"):
+                algorithm_files = extracted_files.setdefault("algorithm_files", [])
+                if isinstance(algorithm_files, list):
+                    algorithm_files.append(file_path)
+            else:
+                other_files = extracted_files.setdefault("other_files", [])
+                if isinstance(other_files, list):
+                    other_files.append(file_path)
+
+    return extracted_files
+
+
+def load_cross_embodiment_descriptions_from_nc_archive(
+    archive_file: Path,
+    extract_to: Path | None = None,
+) -> tuple[CrossEmbodimentDescription, CrossEmbodimentDescription]:
+    """Load cross-embodiment descriptions from a Neuracore model archive.
+
+    Args:
+        archive_file: Path to the NC.ZIP file.
+        extract_to: Optional directory to extract files to.
+            If None, uses a temporary directory.
+
+    Returns:
+        Tuple of input and output cross-embodiment descriptions.
+    """
+    use_temp_dir = extract_to is None
+
+    if use_temp_dir:
+        temp_dir_context = tempfile.TemporaryDirectory()
+        extract_to = Path(temp_dir_context.__enter__())
+    else:
+        temp_dir_context = None
+
+    assert extract_to is not None
+
+    try:
+        extracted_files = extract_nc_archive(archive_file, extract_to)
+        if "input_cross_embodiment_description" not in extracted_files:
+            raise FileNotFoundError(
+                "input_cross_embodiment_description.json not found in archive"
+            )
+        if "output_cross_embodiment_description" not in extracted_files:
+            raise FileNotFoundError(
+                "output_cross_embodiment_description.json not found in archive"
+            )
+
+        with open(
+            _archive_path(extracted_files, "input_cross_embodiment_description")
+        ) as f:
+            input_cross_embodiment_description = json.load(f)
+        with open(
+            _archive_path(extracted_files, "output_cross_embodiment_description")
+        ) as f:
+            output_cross_embodiment_description = json.load(f)
+        return input_cross_embodiment_description, output_cross_embodiment_description
+    finally:
+        if use_temp_dir and temp_dir_context:
+            temp_dir_context.__exit__(None, None, None)
+
+
+def load_model_from_nc_archive(
+    archive_file: Path, extract_to: Path | None = None, device: str | None = None
+) -> tuple[
+    NeuracoreModel,
+    CrossEmbodimentDescription,
+    CrossEmbodimentDescription,
+    PreprocessingConfiguration,
+    PreprocessingConfiguration,
+]:
+    """Load a Neuracore model from a NC.ZIP archive file.
+
+    Extracts the archive file and reconstructs the original Neuracore model instance
+    with its trained weights and configuration.
+
+    Args:
+        archive_file: Path to the NC.ZIP file.
+        extract_to: Optional directory to extract files to.
+            If None, uses a temporary directory.
+        device: Optional device model to be loaded on
+
+    Returns:
+        A tuple containing:
+          - The reconstructed model instance ready for inference.
+          - Input cross-embodiment description loaded from the archive (if present).
+          - Output cross-embodiment description loaded from the archive (if present).
+          - Input preprocessing config loaded from the archive (if present).
+          - Output preprocessing config loaded from the archive (if present).
+    """
+    use_temp_dir = extract_to is None
+
+    if use_temp_dir:
+        temp_dir_context = tempfile.TemporaryDirectory()
+        extract_to = Path(temp_dir_context.__enter__())
+    else:
+        temp_dir_context = None
+
+    assert extract_to is not None
+
+    try:
+        # Extract the archive file
+        extracted_files = extract_nc_archive(archive_file, extract_to)
+
+        # Load model initialization description
+        if "model_init_description" not in extracted_files:
+            raise FileNotFoundError("model_init_description.json not found in archive")
+
+        with open(_archive_path(extracted_files, "model_init_description")) as f:
+            model_init_description = json.load(f)
+        model_init_description = ModelInitDescription.model_validate(
+            model_init_description
+        )
+
+        # Load algorithm config if present
+        algorithm_config = {}
+        if "algorithm_config" in extracted_files:
+            with open(_archive_path(extracted_files, "algorithm_config")) as f:
+                algorithm_config = json.load(f)
+
+        # Load cross-embodiment descriptions if present
+        input_cross_embodiment_description = {}
+        if "input_cross_embodiment_description" in extracted_files:
+            with open(
+                _archive_path(extracted_files, "input_cross_embodiment_description")
+            ) as f:
+                input_cross_embodiment_description = json.load(f)
+        output_cross_embodiment_description = {}
+        if "output_cross_embodiment_description" in extracted_files:
+            with open(
+                _archive_path(extracted_files, "output_cross_embodiment_description")
+            ) as f:
+                output_cross_embodiment_description = json.load(f)
+        input_preprocessing_config: PreprocessingConfiguration = {}
+        if "input_preprocessing_config" in extracted_files:
+            with open(
+                _archive_path(extracted_files, "input_preprocessing_config")
+            ) as f:
+                input_preprocessing_config_serialized = json.load(f)
+                if input_preprocessing_config_serialized:
+                    input_preprocessing_config = resolve_preprocessing_config(
+                        OmegaConf.create(input_preprocessing_config_serialized)
+                    )
+                else:
+                    logger.warning(
+                        "Input preprocessing config in model archive is empty"
+                    )
+        output_preprocessing_config: PreprocessingConfiguration = {}
+        if "output_preprocessing_config" in extracted_files:
+            with open(
+                _archive_path(extracted_files, "output_preprocessing_config")
+            ) as f:
+                output_preprocessing_config_serialized = json.load(f)
+                if output_preprocessing_config_serialized:
+                    output_preprocessing_config = resolve_preprocessing_config(
+                        OmegaConf.create(output_preprocessing_config_serialized)
+                    )
+                else:
+                    logger.warning(
+                        "Output preprocessing config in model archive is empty"
+                    )
+
+        # Find the algorithm directory
+        algorithm_dir = extract_to / "algorithm"
+        if not algorithm_dir.exists():
+            raise FileNotFoundError("Algorithm directory not found in archive")
+
+        # Load the algorithm using AlgorithmLoader
+        algorithm_loader = AlgorithmLoader(algorithm_dir)
+        model_class = algorithm_loader.load_model()
+
+        # Create model instance
+        if device:
+            device = torch.device(device)
+        else:
+            device = get_default_device()
+        model = model_class(model_init_description, **algorithm_config)
+        model = model.to(device)
+
+        # Load trained weights if present
+        if "model_weights" in extracted_files:
+            state_dict = torch.load(
+                extracted_files["model_weights"],
+                map_location=model.device,
+                weights_only=True,
+            )
+            model.load_state_dict(state_dict)
+
+        return (
+            model,
+            input_cross_embodiment_description,
+            output_cross_embodiment_description,
+            input_preprocessing_config,
+            output_preprocessing_config,
+        )
+
+    finally:
+        if use_temp_dir and temp_dir_context:
+            temp_dir_context.__exit__(None, None, None)

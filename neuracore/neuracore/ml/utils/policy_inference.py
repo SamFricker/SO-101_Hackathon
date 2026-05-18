@@ -1,0 +1,315 @@
+"""Policy Inference Module."""
+
+import logging
+import tempfile
+from collections import defaultdict
+from pathlib import Path
+from typing import cast
+
+import torch
+from neuracore_types import (
+    DATA_TYPE_TO_BATCHED_NC_DATA_CLASS,
+    BatchedNCData,
+    DataType,
+    EmbodimentDescription,
+    SynchronizedPoint,
+)
+
+from neuracore.core.auth import get_auth
+from neuracore.core.const import API_URL
+from neuracore.core.utils.download import download_with_progress
+from neuracore.core.utils.http_session import Session
+from neuracore.core.utils.robot_data_spec_utils import (
+    resolve_embodiment_descriptions_with_override,
+)
+from neuracore.ml import BatchedInferenceInputs
+from neuracore.ml.utils.device_utils import get_default_device
+from neuracore.ml.utils.nc_archive import load_model_from_nc_archive
+from neuracore.ml.utils.preprocessing_utils import (
+    PreprocessingConfiguration,
+    apply_preprocessing_methods,
+    validate_preprocessing_configuration,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _indexed_names_from_description(
+    output_names: list[str] | dict[int, str] | dict[str, str],
+) -> list[tuple[int, str]]:
+    """Normalize output names to explicit tensor index/name pairs."""
+    if isinstance(output_names, list):
+        return list(enumerate(output_names))
+    indexed_output_names = cast(dict[int | str, str], output_names)
+    return sorted((int(index), name) for index, name in indexed_output_names.items())
+
+
+class PolicyInference:
+    """PolicyInference class for handling model inference.
+
+    This class is responsible for loading a model from a Neuracore archive,
+    processing incoming data from SynchronizedPoints, and running inference to
+    generate predictions.
+    """
+
+    def __init__(
+        self,
+        model_file: Path,
+        org_id: str,
+        input_embodiment_description: EmbodimentDescription | None = None,
+        output_embodiment_description: EmbodimentDescription | None = None,
+        input_preprocessing_config: PreprocessingConfiguration | None = None,
+        job_id: str | None = None,
+        device: str | None = None,
+        robot_id: str | None = None,
+    ) -> None:
+        """Initialize the policy inference.
+
+        Args:
+            model_file: Path to the model file to load.
+            org_id: ID of the organization for loading checkpoints.
+            input_embodiment_description: Input mapping per supported robot type.
+            output_embodiment_description: Output mapping per supported robot type.
+            job_id: ID of the training job for loading checkpoints.
+            device: Torch device to run the model inference on.
+            robot_id: Robot ID used to select embodiments from cross-embodiment
+                metadata in the model archive when explicit embodiments are not
+                provided.
+            input_preprocessing_config: preprocessing configuration for the input data.
+                When None, values are loaded from the model archive.
+        """
+        self.org_id = org_id
+        self.job_id = job_id
+        (
+            self.model,
+            input_cross_embodiment_description,
+            output_cross_embodiment_description,
+            archive_input_preprocessing_config,
+            _,
+        ) = load_model_from_nc_archive(model_file, device=device)
+        self.model.eval()
+        self.input_dataset_statistics = (
+            self.model.model_init_description.input_dataset_statistics
+        )
+        self.device = torch.device(device) if device else get_default_device()
+        (
+            self.input_embodiment_description,
+            self.output_embodiment_description,
+        ) = resolve_embodiment_descriptions_with_override(
+            input_embodiment_description=input_embodiment_description,
+            output_embodiment_description=output_embodiment_description,
+            robot_id=robot_id,
+            job_id=job_id,
+            model_file=model_file,
+            input_cross_embodiment_description=input_cross_embodiment_description,
+            output_cross_embodiment_description=output_cross_embodiment_description,
+        )
+
+        self.input_preprocessing_config = (
+            input_preprocessing_config or archive_input_preprocessing_config
+        )
+        if not self.input_preprocessing_config:
+            raise ValueError(
+                "Input preprocessing configuration is missing "
+                "from policy initialization and not found in the model archive! "
+                "Please provide a input preprocessing configuration."
+            )
+        if input_preprocessing_config:
+            validate_preprocessing_configuration(
+                preprocessing_config=self.input_preprocessing_config
+            )
+
+        self.prediction_horizon = (
+            self.model.model_init_description.output_prediction_horizon
+        )
+
+    def _preprocess(self, sync_point: SynchronizedPoint) -> BatchedInferenceInputs:
+        """Preprocess incoming sync point into model-compatible format.
+
+        Converts a single SynchronizedPoint data into batched tensors suitable
+        for model inference.
+        Handles multiple data modalities including joint states,
+        images, and language instructions.
+
+        Args:
+            sync_point: SynchronizedPoint containing data from a single time step.
+
+        Returns:
+            BatchedInferenceSamples object ready for model inference.
+        """
+        inputs: dict[DataType, list[BatchedNCData]] = {}
+        inputs_mask: dict[DataType, torch.Tensor] = {}  # Dict[DataType, (B, MAX_LEN)]
+        # We need to go from sync_point (single time step) to BatchedNCData
+        for data_type in sync_point.data.keys():
+            inputs[data_type] = []
+            max_items_for_this_data_type = len(sync_point.data[data_type])
+            trained_statistics = self.input_dataset_statistics.get(data_type)
+            if trained_statistics is None:
+                raise ValueError(
+                    f"Model was not trained with input statistics for {data_type}."
+                )
+            max_items_trained_on = len(trained_statistics)
+            if max_items_for_this_data_type > max_items_trained_on:
+                raise ValueError(
+                    f"Received {max_items_for_this_data_type} items for data type "
+                    f"{data_type}, but model was trained on maximum of "
+                    f"{max_items_trained_on} items."
+                )
+            inputs_mask[data_type] = torch.tensor(
+                [1.0] * max_items_for_this_data_type
+                + [0.0] * (max_items_trained_on - max_items_for_this_data_type),
+                dtype=torch.float32,
+            )
+            inputs_mask[data_type].unsqueeze_(0)  # Add batch dimension
+            for _, nc_data in sync_point.data[data_type].items():
+                tensor = DATA_TYPE_TO_BATCHED_NC_DATA_CLASS[data_type].from_nc_data(
+                    nc_data
+                )
+                tensor = apply_preprocessing_methods(
+                    batched_data=tensor,
+                    methods=self.input_preprocessing_config.get(data_type, []),
+                )
+                inputs[data_type].append(tensor)
+        return BatchedInferenceInputs(
+            inputs=inputs,
+            inputs_mask=inputs_mask,
+            batch_size=1,
+        ).to(self.device)
+
+    def set_checkpoint(
+        self, epoch: int | None = None, checkpoint_file: str | None = None
+    ) -> None:
+        """Set the model checkpoint to use for inference.
+
+        Args:
+            epoch: The epoch number of the checkpoint to load.
+                -1 to load the latest checkpoint.
+            checkpoint_file: Optional path to a specific checkpoint file.
+                If provided, overrides the epoch setting.
+        """
+        if epoch is not None:
+            if epoch < -1:
+                raise ValueError("Epoch must be -1 (latest) or a non-negative integer.")
+            if self.org_id is None or self.job_id is None:
+                raise ValueError(
+                    "Organization ID and Job ID must be set to load checkpoints."
+                )
+            checkpoint_name = f"checkpoint_{epoch if epoch != -1 else 'latest'}.pt"
+            checkpoint_path = (
+                Path(tempfile.gettempdir()) / self.job_id / checkpoint_name
+            )
+            if not checkpoint_path.exists():
+                checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                with Session() as session:
+                    response = session.get(
+                        f"{API_URL}/org/{self.org_id}/training/jobs/{self.job_id}/checkpoint_url/{checkpoint_name}",
+                        headers=get_auth().get_headers(),
+                        timeout=30,
+                    )
+                if response.status_code == 404:
+                    raise ValueError(f"Checkpoint {checkpoint_name} does not exist.")
+                checkpoint_path = download_with_progress(
+                    response.json()["url"],
+                    f"Downloading checkpoint {checkpoint_name}",
+                    destination=checkpoint_path,
+                )
+        elif checkpoint_file is not None:
+            checkpoint_path = Path(checkpoint_file)
+        else:
+            raise ValueError("Must specify either epoch or checkpoint_file.")
+
+        self.model.load_state_dict(
+            torch.load(checkpoint_path, map_location=self.device, weights_only=True),
+            strict=False,
+        )
+
+    def _assign_names_to_model_outputs(
+        self,
+        batch_output: dict[DataType, list[BatchedNCData]],
+    ) -> dict[DataType, dict[str, BatchedNCData]]:
+        """Convert model prediction output to SynchronizedPoint format.
+
+        Args:
+            batch_output: ModelPrediction containing the model's outputs.
+
+        Returns:
+            SynchronizedPoint with processed outputs.
+        """
+        outputs: dict[DataType, dict[str, BatchedNCData]] = defaultdict(dict)
+
+        # Map outputs to SynchronizedPoint fields based on output_mapping
+        for data_type, list_of_batched_ncdata in batch_output.items():
+            output_names = self.output_embodiment_description.get(data_type)
+
+            # Check that there are enough output names for the data type
+            if output_names is None:
+                raise ValueError(f"DataType {data_type} not in output configuration.")
+            indexed_output_names = _indexed_names_from_description(output_names)
+            required_tensor_count = (
+                max(index for index, _ in indexed_output_names) + 1
+                if indexed_output_names
+                else 0
+            )
+            # Dict-backed specs may be sparse, so preserve their absolute tensor
+            # indices instead of collapsing them into dense positions.
+            if len(list_of_batched_ncdata) < required_tensor_count:
+                raise ValueError(
+                    f"Not enough output names for DataType {data_type}. "
+                    "Expected at least "
+                    f"{required_tensor_count}, "
+                    f"but got {len(list_of_batched_ncdata)}."
+                )
+
+            for tensor_idx, name_of_tensor in indexed_output_names:
+                batched_nc_data = list_of_batched_ncdata[tensor_idx]
+                outputs[data_type][name_of_tensor] = batched_nc_data
+
+        return outputs
+
+    def _validate_input_sync_point(self, sync_point: SynchronizedPoint) -> None:
+        """Validate the sync point with what the model had as input.
+
+        Ensures that the sync point contains all required data types
+        as specified in the model's input data types.
+
+        Args:
+            sync_point: SynchronizedPoint containing data from a single time step.
+
+        Raises:
+            ValueError: If the sync point does not contain required data types.
+        """
+        input_cross_embodiment_description = (
+            self.model.model_init_description.input_data_types
+        )
+        missing_data_types = []
+        for data_type in input_cross_embodiment_description:
+            # Convert string to DataType enum if needed
+            # (can happen after JSON deserialization)
+            if isinstance(data_type, str):
+                data_type = DataType(data_type)
+            if data_type not in sync_point.data:
+                missing_data_types.append(data_type)
+        if missing_data_types:
+            raise ValueError(
+                "SynchronizedPoint is missing required data types: "
+                f"{', '.join(missing_data_types)}"
+            )
+
+    def __call__(
+        self,
+        sync_point: SynchronizedPoint,
+    ) -> dict[DataType, dict[str, BatchedNCData]]:
+        """Process a single sync point and run inference.
+
+        Args:
+            sync_point: SynchronizedPoint containing data from a single time step.
+
+        Returns:
+            SynchronizedPoint with model predictions filled in for each robot.
+        """
+        sync_point = sync_point.order(self.input_embodiment_description)
+        self._validate_input_sync_point(sync_point)
+        batch = self._preprocess(sync_point)
+        with torch.no_grad():
+            batch_output: dict[DataType, list[BatchedNCData]] = self.model(batch)
+            return self._assign_names_to_model_outputs(batch_output)
