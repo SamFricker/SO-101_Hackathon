@@ -61,24 +61,19 @@ Entry point for the full pipeline: **`example_so101/examples/mainFINAL.py`**.
 
 Videos are stored in the [`Videos/`](Videos/) directory.
 
----
-
 ### Leader → follower teleop (development)
 
 [Watch video](Videos/leader_follower_demo.mp4)
 
----
-
 ### Dry sock runs
 
-- [Dry test 1](Videos/dry_test1.mp4)
-- [Dry test 2](Videos/dry_test2.mp4)
-
----
+[Dry test 1](Videos/dry_test1.mp4)
+[Dry test 2](Videos/dry_test2.mp4)
 
 ### Wet sock run
 
 [Watch wet test](Videos/wet_test.mp4)
+
 ---
 
 ## Repository layout
