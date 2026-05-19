@@ -10,7 +10,7 @@
 ## Next steps and reflections
 The project was successful in developing a working demo before the deadline. This was cut close as we were initially planning on training the arm using neuracore AI infrastructure and imitation learning data from the leader arm however the data upload failed at the end of day 1 so the project had to be pivoted. Working with innovative AI technologies has given an insight into how the future of high efficiency robotics engineering might look and familiarity using these tools particularly working with AI agents within coding environments.
 
-The robot use case can expand greatly. By switching out the humidity sensor **we have created a robotic system that can sort objects based on any sensed condition**, for example a camera can allow sorting ripe and unripe fruit by colout. Future improvements might include sensor fusion to test for multiple conditions or a convolutional neural network that can pinpoint any object and the end effector positions on the camera to allow for more accurate moevment of the end effector.
+The robot use case can expand greatly. By switching out the humidity sensor **we have created a robotic system that can sort objects based on any sensed condition**, for example a camera can allow sorting ripe and unripe fruit by colour. Future improvements might include sensor fusion to test for multiple conditions or a convolutional neural network that can pinpoint any object and the end effector positions on the camera to allow for more accurate moevment.
 
 
 ---
