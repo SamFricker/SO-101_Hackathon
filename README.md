@@ -59,21 +59,26 @@ Entry point for the full pipeline: **`example_so101/examples/mainFINAL.py`**.
 
 ### Local test videos
 
-Videos live in [`Videos/`](Videos/). GitHub renders these inline in the README:
+Videos are stored in the [`Videos/`](Videos/) directory.
 
-**Leader -> follower teleop (development)**
+---
 
-<video src="Videos/leader_follower_demo.mp4" width="640" controls></video>
+### Leader → follower teleop (development)
 
-**Dry sock runs**
+[Watch video](Videos/leader_follower_demo.mp4)
 
-<video src="Videos/dry_test1.mp4" width="320" controls></video>
-<video src="Videos/dry_test2.mp4" width="320" controls></video>
+---
 
-**Wet sock run**
+### Dry sock runs
 
-<video src="Videos/wet_test.mp4" width="640" controls></video>
+- [Dry test 1](Videos/dry_test1.mp4)
+- [Dry test 2](Videos/dry_test2.mp4)
 
+---
+
+### Wet sock run
+
+[Watch wet test](Videos/wet_test.mp4)
 ---
 
 ## Repository layout
